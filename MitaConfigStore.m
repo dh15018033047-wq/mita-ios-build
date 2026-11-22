@@ -101,6 +101,7 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
         @"block_marketing": @(YES),
         @"admin_wechat_control": @(YES),
         @"recognize_admin_in_group": @(YES),
+        @"verify_admin_avatar_wxid": @(YES),
         @"group_split_bubbles": @(YES),
         @"api_base_url": seed[@"api_base_url"] ?: @"https://api.2889372.xyz/v1",
         @"api_key": seed[@"api_key"] ?: @"",
@@ -109,8 +110,9 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
         @"pc_sync_url": seed[@"pc_sync_url"] ?: @"http://192.168.1.34:18765",
         @"persona_id": seed[@"persona_id"] ?: @"sweet",
         @"custom_prompt": [self promptForPersonaId:(seed[@"persona_id"] ?: @"sweet")],
-        @"admin_pin": @"",
-        @"admin_contacts": seed[@"admin_contacts"] ?: @[@"00", @"00670", @"kazuma670"],
+        @"admin_contacts": seed[@"admin_contacts"] ?: @[@"00"],
+        @"admin_wxids": seed[@"admin_wxids"] ?: @[@"kazuma670", @"00670"],
+        @"fetched_models": seed[@"fetched_models"] ?: @[@"gemini-3.5-flash-lite", @"grok-4.7"],
         @"allowed_contacts": seed[@"allowed_contacts"] ?: @[@"00", @"00670", @"kazuma670"],
         @"allowed_groups": seed[@"allowed_groups"] ?: @[],
         @"group_keywords": seed[@"group_keywords"] ?: @"豆奶,@豆奶,米塔",
@@ -214,6 +216,9 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
 - (BOOL)recognizeAdminInGroup { [self.lock lock]; BOOL v = [self.data[@"recognize_admin_in_group"] boolValue]; [self.lock unlock]; return v; }
 - (void)setRecognizeAdminInGroup:(BOOL)v { [self.lock lock]; self.data[@"recognize_admin_in_group"] = @(v); [self saveLocked]; [self.lock unlock]; }
 
+- (BOOL)verifyAdminAvatarWxid { [self.lock lock]; BOOL v = self.data[@"verify_admin_avatar_wxid"] ? [self.data[@"verify_admin_avatar_wxid"] boolValue] : YES; [self.lock unlock]; return v; }
+- (void)setVerifyAdminAvatarWxid:(BOOL)v { [self.lock lock]; self.data[@"verify_admin_avatar_wxid"] = @(v); [self saveLocked]; [self.lock unlock]; }
+
 - (BOOL)groupSplitBubbles { [self.lock lock]; BOOL v = [self.data[@"group_split_bubbles"] boolValue]; [self.lock unlock]; return v; }
 - (void)setGroupSplitBubbles:(BOOL)v { [self.lock lock]; self.data[@"group_split_bubbles"] = @(v); [self saveLocked]; [self.lock unlock]; }
 
@@ -259,9 +264,6 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
 
 - (NSString *)customPrompt { return [self strForKey:@"custom_prompt" def:[self promptForPersonaId:@"sweet"]]; }
 - (void)setCustomPrompt:(NSString *)v { [self setStr:v forKey:@"custom_prompt"]; }
-
-- (NSString *)adminPin { return [self strForKey:@"admin_pin" def:@""]; }
-- (void)setAdminPin:(NSString *)v { [self setStr:v forKey:@"admin_pin"]; }
 
 - (NSString *)groupKeywords { return [self strForKey:@"group_keywords" def:@"豆奶,@豆奶,米塔"]; }
 - (void)setGroupKeywords:(NSString *)v { [self setStr:v forKey:@"group_keywords"]; }
@@ -328,8 +330,14 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
     [self.lock unlock];
 }
 
-- (NSArray<NSString *> *)adminContacts { return [self arrForKey:@"admin_contacts" def:@[@"00", @"00670", @"kazuma670"]]; }
+- (NSArray<NSString *> *)adminContacts { return [self arrForKey:@"admin_contacts" def:@[@"00"]]; }
 - (void)setAdminContacts:(NSArray<NSString *> *)v { [self setArr:v forKey:@"admin_contacts"]; }
+
+- (NSArray<NSString *> *)adminWxids { return [self arrForKey:@"admin_wxids" def:@[@"kazuma670", @"00670"]]; }
+- (void)setAdminWxids:(NSArray<NSString *> *)v { [self setArr:v forKey:@"admin_wxids"]; }
+
+- (NSArray<NSString *> *)fetchedModels { return [self arrForKey:@"fetched_models" def:@[@"gemini-3.5-flash-lite", @"grok-4.7"]]; }
+- (void)setFetchedModels:(NSArray<NSString *> *)v { [self setArr:v forKey:@"fetched_models"]; }
 
 - (NSArray<NSString *> *)allowedContacts {
     NSMutableArray *base = [[self arrForKey:@"allowed_contacts" def:@[@"00", @"00670", @"kazuma670"]] mutableCopy];
@@ -406,8 +414,8 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
     [self.lock lock];
     NSArray *boolKeys = @[
         @"bot_enabled", @"keep_alive_enabled", @"whitelist_only", @"block_new_friends",
-        @"block_marketing", @"admin_wechat_control", @"recognize_admin_in_group", @"group_split_bubbles",
-        @"ad_guard_enabled", @"auto_kick_enabled", @"auto_approve_join_enabled"
+        @"block_marketing", @"admin_wechat_control", @"recognize_admin_in_group", @"verify_admin_avatar_wxid",
+        @"group_split_bubbles", @"ad_guard_enabled", @"auto_kick_enabled", @"auto_approve_join_enabled"
     ];
     for (NSString *k in boolKeys) {
         if (dict[k] != nil && dict[k] != [NSNull null]) {
@@ -416,13 +424,13 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
     }
     NSArray *strKeys = @[
         @"api_base_url", @"api_model", @"pc_sync_url", @"custom_prompt",
-        @"admin_pin", @"group_keywords", @"group_vibe_mode", @"group_perm_mode",
+        @"group_keywords", @"group_vibe_mode", @"group_perm_mode",
         @"ad_keywords", @"ad_warn_template", @"ad_kick_template"
     ];
     for (NSString *k in strKeys) {
         if ([dict[k] isKindOfClass:[NSString class]]) {
             NSString *val = [(NSString *)dict[k] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if (val.length > 0 || [k isEqualToString:@"admin_pin"] || [k isEqualToString:@"pc_sync_url"]) {
+            if (val.length > 0 || [k isEqualToString:@"pc_sync_url"]) {
                 self.data[k] = val;
             }
         }
@@ -443,7 +451,7 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
         }
     }
     NSArray *arrKeys = @[
-        @"admin_contacts", @"allowed_contacts", @"allowed_groups",
+        @"admin_contacts", @"admin_wxids", @"fetched_models", @"allowed_contacts", @"allowed_groups",
         @"group_sub_admins", @"group_authorized_members", @"group_muted_members"
     ];
     for (NSString *k in arrKeys) {

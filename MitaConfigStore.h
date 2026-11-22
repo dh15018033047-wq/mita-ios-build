@@ -13,6 +13,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) BOOL blockMarketing;
 @property (nonatomic, assign) BOOL adminWeChatControl;
 @property (nonatomic, assign) BOOL recognizeAdminInGroup;
+@property (nonatomic, assign) BOOL verifyAdminAvatarWxid;
 @property (nonatomic, assign) BOOL groupSplitBubbles;
 @property (nonatomic, assign) BOOL adGuardEnabled;
 @property (nonatomic, assign) BOOL autoKickEnabled;
@@ -25,7 +26,6 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy) NSString *pcSyncUrl;
 @property (nonatomic, copy) NSString *personaId;
 @property (nonatomic, copy) NSString *customPrompt;
-@property (nonatomic, copy) NSString *adminPin;
 @property (nonatomic, copy) NSString *groupKeywords;
 @property (nonatomic, copy) NSString *groupVibeMode;    // natural | light | lively | at_only
 @property (nonatomic, copy) NSString *groupPermMode;    // all | authorized_only | admin_only
@@ -42,6 +42,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) NSInteger approveMaxPerBatch;
 
 @property (nonatomic, copy) NSArray<NSString *> *adminContacts;
+@property (nonatomic, copy) NSArray<NSString *> *adminWxids;
+@property (nonatomic, copy) NSArray<NSString *> *fetchedModels;
 @property (nonatomic, copy) NSArray<NSString *> *allowedContacts;
 @property (nonatomic, copy) NSArray<NSString *> *allowedGroups;
 @property (nonatomic, copy) NSArray<NSString *> *groupSubAdmins;

@@ -67,7 +67,7 @@
         @"platform": @"ios",
         @"app": @"MitaPhoneAgent",
         @"app_title": @"米塔 手机智能体 (巨魔版)",
-        @"version": @"2.5.0",
+        @"version": @"2.7.0",
         @"model": [MitaKeepAliveAndControl deviceModelName],
         @"ios_version": [UIDevice currentDevice].systemVersion ?: @"15.7.9",
         @"width": @((int)nb.size.width),

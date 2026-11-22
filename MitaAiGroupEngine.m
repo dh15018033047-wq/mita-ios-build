@@ -119,27 +119,23 @@
 
 - (NSDictionary *)resolveGroupRoleForSender:(NSString *)sender body:(NSString *)body {
     MitaConfigStore *store = [MitaConfigStore shared];
-    NSString *pin = store.adminPin;
-    BOOL pinOk = (pin.length == 0) || [body containsString:pin];
-    NSString *cleanBody = (pin.length > 0 && [body containsString:pin])
-        ? [[body stringByReplacingOccurrencesOfString:pin withString:@""] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]
-        : body;
+    NSString *cleanBody = [body ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 
     if (store.recognizeAdminInGroup) {
-        if ([self list:store.adminContacts containsNormalized:sender]) {
-            return @{@"role": @"owner", @"is_owner": @(YES), @"is_admin": @(YES), @"pin_ok": @(pinOk), @"clean_body": cleanBody};
+        if ([self list:store.adminContacts containsNormalized:sender] || [self list:store.adminWxids containsNormalized:sender]) {
+            return @{@"role": @"owner", @"is_owner": @(YES), @"is_admin": @(YES), @"pin_ok": @(YES), @"clean_body": cleanBody};
         }
         if ([self list:store.groupSubAdmins containsNormalized:sender]) {
-            return @{@"role": @"sub_admin", @"is_owner": @(NO), @"is_admin": @(YES), @"pin_ok": @(pinOk), @"clean_body": cleanBody};
+            return @{@"role": @"sub_admin", @"is_owner": @(NO), @"is_admin": @(YES), @"pin_ok": @(YES), @"clean_body": cleanBody};
         }
     }
     if ([self list:store.groupMutedMembers containsNormalized:sender]) {
-        return @{@"role": @"muted", @"is_owner": @(NO), @"is_admin": @(NO), @"pin_ok": @(NO), @"clean_body": body};
+        return @{@"role": @"muted", @"is_owner": @(NO), @"is_admin": @(NO), @"pin_ok": @(NO), @"clean_body": cleanBody};
     }
     if ([self list:store.groupAuthorizedMembers containsNormalized:sender]) {
-        return @{@"role": @"authorized", @"is_owner": @(NO), @"is_admin": @(NO), @"pin_ok": @(NO), @"clean_body": body};
+        return @{@"role": @"authorized", @"is_owner": @(NO), @"is_admin": @(NO), @"pin_ok": @(NO), @"clean_body": cleanBody};
     }
-    return @{@"role": @"member", @"is_owner": @(NO), @"is_admin": @(NO), @"pin_ok": @(NO), @"clean_body": body};
+    return @{@"role": @"member", @"is_owner": @(NO), @"is_admin": @(NO), @"pin_ok": @(NO), @"clean_body": cleanBody};
 }
 
 - (BOOL)isNewFriendOrMarketing:(NSString *)text checkNewFriend:(BOOL)chkNew checkMarketing:(BOOL)chkMkt outReason:(NSString **)reason {
@@ -335,11 +331,11 @@
     NSString *cmd = [self stripMentionPrefix:body];
     NSDictionary *roleInfo = isGroup
         ? [self resolveGroupRoleForSender:sender body:cmd]
-        : @{@"role": ([self list:store.adminContacts containsNormalized:contact] ? @"owner" : @"member"),
-            @"is_owner": @([self list:store.adminContacts containsNormalized:contact]),
-            @"is_admin": @([self list:store.adminContacts containsNormalized:contact]),
-            @"pin_ok": @(store.adminPin.length == 0 || [cmd containsString:store.adminPin]),
-            @"clean_body": (store.adminPin.length > 0 ? [[cmd stringByReplacingOccurrencesOfString:store.adminPin withString:@""] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] : cmd)};
+        : @{@"role": (([self list:store.adminContacts containsNormalized:contact] || [self list:store.adminWxids containsNormalized:contact]) ? @"owner" : @"member"),
+            @"is_owner": @([self list:store.adminContacts containsNormalized:contact] || [self list:store.adminWxids containsNormalized:contact]),
+            @"is_admin": @([self list:store.adminContacts containsNormalized:contact] || [self list:store.adminWxids containsNormalized:contact]),
+            @"pin_ok": @(YES),
+            @"clean_body": cmd};
 
     BOOL isOwner = [roleInfo[@"is_owner"] boolValue] && [roleInfo[@"pin_ok"] boolValue];
     BOOL isAdmin = [roleInfo[@"is_admin"] boolValue] && [roleInfo[@"pin_ok"] boolValue];
@@ -597,6 +593,8 @@
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.HTTPMethod = @"POST";
     [req setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+    [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148" forHTTPHeaderField:@"User-Agent"];
     [req setValue:[NSString stringWithFormat:@"Bearer %@", apiKey] forHTTPHeaderField:@"Authorization"];
     req.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
 
@@ -765,30 +763,100 @@
 
 - (void)fetchModelsWithBaseUrl:(NSString *)baseUrl apiKey:(NSString *)apiKey completion:(void (^)(NSDictionary *result))completion {
     MitaConfigStore *store = [MitaConfigStore shared];
-    NSString *base = (baseUrl.length > 0 ? baseUrl : store.apiBaseUrl);
+    NSString *base = [(baseUrl.length > 0 ? baseUrl : store.apiBaseUrl) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     while ([base hasSuffix:@"/"]) base = [base substringToIndex:base.length - 1];
-    NSString *key = (apiKey.length > 0 && ![apiKey containsString:@"****"]) ? apiKey : [store effectiveApiKey];
+    if (base.length == 0) {
+        completion(@{@"ok": @(NO), @"error": @"请先填写 API 接口地址"});
+        return;
+    }
+
+    // 整理需要请求的 Key 列表：若用户手动填了新 Key 则仅用该 Key；否则同时尝试主 Key 与备用 Gemini Key 合并该中转站全部可用模型
+    NSMutableArray<NSString *> *keysToTry = [NSMutableArray array];
+    NSString *manualKey = [apiKey ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (manualKey.length > 0 && ![manualKey containsString:@"****"]) {
+        [keysToTry addObject:manualKey];
+    } else {
+        if (store.apiKey.length > 0) [keysToTry addObject:store.apiKey];
+        if (store.geminiApiKey.length > 0 && ![keysToTry containsObject:store.geminiApiKey]) [keysToTry addObject:store.geminiApiKey];
+        if (keysToTry.count == 0) [keysToTry addObject:@""];
+    }
+
     NSURL *url = [NSURL URLWithString:[base stringByAppendingString:@"/models"]];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    if (key.length > 0) [req setValue:[NSString stringWithFormat:@"Bearer %@", key] forHTTPHeaderField:@"Authorization"];
-    [[self.urlSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        if (err || !data) {
-            completion(@{@"ok": @(NO), @"error": err.localizedDescription ?: @"网络错误"});
-            return;
+    if (!url) {
+        completion(@{@"ok": @(NO), @"error": @"API 地址格式不正确"});
+        return;
+    }
+
+    dispatch_group_t grp = dispatch_group_create();
+    NSMutableOrderedSet<NSString *> *merged = [NSMutableOrderedSet orderedSet];
+    __block NSString *lastErr = @"";
+    __block BOOL anySuccess = NO;
+    NSLock *mergeLock = [[NSLock alloc] init];
+
+    for (NSString *k in keysToTry) {
+        dispatch_group_enter(grp);
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+        req.HTTPMethod = @"GET";
+        req.timeoutInterval = 12.0;
+        [req setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+        [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148" forHTTPHeaderField:@"User-Agent"];
+        if (k.length > 0) {
+            [req setValue:[NSString stringWithFormat:@"Bearer %@", k] forHTTPHeaderField:@"Authorization"];
         }
-        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        NSMutableArray *out = [NSMutableArray array];
-        if ([obj isKindOfClass:[NSDictionary class]] && [obj[@"data"] isKindOfClass:[NSArray class]]) {
-            for (NSDictionary *row in obj[@"data"]) {
-                NSString *mid = row[@"id"];
-                NSString *low = [mid lowercaseString];
-                if (mid.length > 0 && ![low containsString:@"gpt"] && ![low containsString:@"image"] && ![low containsString:@"flux"] && ![low containsString:@"dall"]) {
-                    [out addObject:mid];
+        [[self.urlSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)resp;
+            NSInteger code = httpResp ? httpResp.statusCode : 0;
+            [mergeLock lock];
+            if (err || !data) {
+                lastErr = err.localizedDescription ?: @"无法连接上游接口";
+            } else if (code < 200 || code >= 300) {
+                NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+                if (raw.length > 90) raw = [[raw substringToIndex:90] stringByAppendingString:@"..."];
+                lastErr = [NSString stringWithFormat:@"HTTP %ld %@", (long)code, raw];
+            } else {
+                id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                NSArray *rows = nil;
+                if ([obj isKindOfClass:[NSDictionary class]]) {
+                    if ([obj[@"data"] isKindOfClass:[NSArray class]]) rows = obj[@"data"];
+                    else if ([obj[@"models"] isKindOfClass:[NSArray class]]) rows = obj[@"models"];
+                } else if ([obj isKindOfClass:[NSArray class]]) {
+                    rows = (NSArray *)obj;
+                }
+                if (rows) {
+                    anySuccess = YES;
+                    for (id row in rows) {
+                        NSString *mid = nil;
+                        if ([row isKindOfClass:[NSDictionary class]]) {
+                            mid = [row[@"id"] isKindOfClass:[NSString class]] ? row[@"id"] : ([row[@"name"] isKindOfClass:[NSString class]] ? row[@"name"] : nil);
+                        } else if ([row isKindOfClass:[NSString class]]) {
+                            mid = (NSString *)row;
+                        }
+                        mid = [mid ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                        NSString *low = [mid lowercaseString];
+                        if (mid.length > 0 && ![low containsString:@"embedding"] && ![low containsString:@"whisper"] && ![low containsString:@"tts-"] && ![low containsString:@"dall-e"] && ![low containsString:@"flux"] && ![low containsString:@"moderation"]) {
+                            [merged addObject:mid];
+                        }
+                    }
+                } else {
+                    lastErr = @"上游返回格式非标准 OpenAI 模型列表";
                 }
             }
+            [mergeLock unlock];
+            dispatch_group_leave(grp);
+        }] resume];
+    }
+
+    dispatch_group_notify(grp, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSArray<NSString *> *list = [merged array];
+        if (list.count > 0) {
+            store.fetchedModels = list;
+            completion(@{@"ok": @(YES), @"models": list, @"count": @(list.count)});
+        } else if (anySuccess) {
+            completion(@{@"ok": @(NO), @"error": @"上游接口连通但未返回可用对话模型"});
+        } else {
+            completion(@{@"ok": @(NO), @"error": lastErr.length ? lastErr : @"拉取模型列表失败"});
         }
-        completion(@{@"ok": @(YES), @"models": out});
-    }] resume];
+    });
 }
 
 #pragma mark - Two-Way PC Sync
