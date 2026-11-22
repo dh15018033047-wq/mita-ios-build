@@ -122,7 +122,18 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
         @"group_authorized_members": @[],
         @"group_muted_members": @[],
         @"max_replies_per_hour": @(45),
-        @"cooldown_sec": @(3)
+        @"cooldown_sec": @(3),
+        @"ad_guard_enabled": @(NO),
+        @"auto_kick_enabled": @(NO),
+        @"warn_kick_threshold": @(3),
+        @"ad_keywords": seed[@"ad_keywords"] ?: @"加微,加V,扫码进群,兼职刷单,日结,代开发票,低价代充,引流,点击链接,免费领,招代理",
+        @"ad_warn_template": seed[@"ad_warn_template"] ?: @"@{sender} 群里禁止发广告推广哈，先提醒一次（第 {count}/{limit} 次），请注意哦",
+        @"ad_kick_template": seed[@"ad_kick_template"] ?: @"@{sender} 已累计违规发广告 {count} 次，按群规移出本群",
+        @"ad_evidence_logs": @[],
+        @"auto_approve_join_enabled": @(NO),
+        @"approve_interval_min": @(15),
+        @"approve_max_per_batch": @(5),
+        @"join_approval_logs": @[]
     } mutableCopy];
 
     if (saved) {
@@ -206,6 +217,15 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
 - (BOOL)groupSplitBubbles { [self.lock lock]; BOOL v = [self.data[@"group_split_bubbles"] boolValue]; [self.lock unlock]; return v; }
 - (void)setGroupSplitBubbles:(BOOL)v { [self.lock lock]; self.data[@"group_split_bubbles"] = @(v); [self saveLocked]; [self.lock unlock]; }
 
+- (BOOL)adGuardEnabled { [self.lock lock]; BOOL v = [self.data[@"ad_guard_enabled"] boolValue]; [self.lock unlock]; return v; }
+- (void)setAdGuardEnabled:(BOOL)v { [self.lock lock]; self.data[@"ad_guard_enabled"] = @(v); [self saveLocked]; [self.lock unlock]; }
+
+- (BOOL)autoKickEnabled { [self.lock lock]; BOOL v = [self.data[@"auto_kick_enabled"] boolValue]; [self.lock unlock]; return v; }
+- (void)setAutoKickEnabled:(BOOL)v { [self.lock lock]; self.data[@"auto_kick_enabled"] = @(v); [self saveLocked]; [self.lock unlock]; }
+
+- (BOOL)autoApproveJoinEnabled { [self.lock lock]; BOOL v = [self.data[@"auto_approve_join_enabled"] boolValue]; [self.lock unlock]; return v; }
+- (void)setAutoApproveJoinEnabled:(BOOL)v { [self.lock lock]; self.data[@"auto_approve_join_enabled"] = @(v); [self saveLocked]; [self.lock unlock]; }
+
 - (NSString *)strForKey:(NSString *)k def:(NSString *)d {
     [self.lock lock];
     NSString *v = [self.data[k] isKindOfClass:[NSString class]] ? self.data[k] : d;
@@ -252,6 +272,15 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
 - (NSString *)groupPermMode { return [self strForKey:@"group_perm_mode" def:@"all"]; }
 - (void)setGroupPermMode:(NSString *)v { [self setStr:v forKey:@"group_perm_mode"]; }
 
+- (NSString *)adKeywords { return [self strForKey:@"ad_keywords" def:@"加微,加V,扫码进群,兼职刷单,日结,代开发票,低价代充,引流,点击链接,免费领,招代理"]; }
+- (void)setAdKeywords:(NSString *)v { [self setStr:v forKey:@"ad_keywords"]; }
+
+- (NSString *)adWarnTemplate { return [self strForKey:@"ad_warn_template" def:@"@{sender} 群里禁止发广告推广哈，先提醒一次（第 {count}/{limit} 次），请注意哦"]; }
+- (void)setAdWarnTemplate:(NSString *)v { [self setStr:v forKey:@"ad_warn_template"]; }
+
+- (NSString *)adKickTemplate { return [self strForKey:@"ad_kick_template" def:@"@{sender} 已累计违规发广告 {count} 次，按群规移出本群"]; }
+- (void)setAdKickTemplate:(NSString *)v { [self setStr:v forKey:@"ad_kick_template"]; }
+
 - (NSInteger)intForKey:(NSString *)k def:(NSInteger)d {
     [self.lock lock];
     NSInteger v = self.data[k] ? [self.data[k] integerValue] : d;
@@ -276,6 +305,15 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
 
 - (NSInteger)cooldownSec { return MAX(1, [self intForKey:@"cooldown_sec" def:3]); }
 - (void)setCooldownSec:(NSInteger)v { [self setInt:MAX(1, v) forKey:@"cooldown_sec"]; }
+
+- (NSInteger)warnKickThreshold { return MAX(1, MIN(10, [self intForKey:@"warn_kick_threshold" def:3])); }
+- (void)setWarnKickThreshold:(NSInteger)v { [self setInt:MAX(1, MIN(10, v)) forKey:@"warn_kick_threshold"]; }
+
+- (NSInteger)approveIntervalMin { return MAX(1, MIN(240, [self intForKey:@"approve_interval_min" def:15])); }
+- (void)setApproveIntervalMin:(NSInteger)v { [self setInt:MAX(1, MIN(240, v)) forKey:@"approve_interval_min"]; }
+
+- (NSInteger)approveMaxPerBatch { return MAX(1, MIN(30, [self intForKey:@"approve_max_per_batch" def:5])); }
+- (void)setApproveMaxPerBatch:(NSInteger)v { [self setInt:MAX(1, MIN(30, v)) forKey:@"approve_max_per_batch"]; }
 
 - (NSArray<NSString *> *)arrForKey:(NSString *)k def:(NSArray<NSString *> *)d {
     [self.lock lock];
@@ -368,7 +406,8 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
     [self.lock lock];
     NSArray *boolKeys = @[
         @"bot_enabled", @"keep_alive_enabled", @"whitelist_only", @"block_new_friends",
-        @"block_marketing", @"admin_wechat_control", @"recognize_admin_in_group", @"group_split_bubbles"
+        @"block_marketing", @"admin_wechat_control", @"recognize_admin_in_group", @"group_split_bubbles",
+        @"ad_guard_enabled", @"auto_kick_enabled", @"auto_approve_join_enabled"
     ];
     for (NSString *k in boolKeys) {
         if (dict[k] != nil && dict[k] != [NSNull null]) {
@@ -377,7 +416,8 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
     }
     NSArray *strKeys = @[
         @"api_base_url", @"api_model", @"pc_sync_url", @"custom_prompt",
-        @"admin_pin", @"group_keywords", @"group_vibe_mode", @"group_perm_mode"
+        @"admin_pin", @"group_keywords", @"group_vibe_mode", @"group_perm_mode",
+        @"ad_keywords", @"ad_warn_template", @"ad_kick_template"
     ];
     for (NSString *k in strKeys) {
         if ([dict[k] isKindOfClass:[NSString class]]) {
@@ -415,6 +455,29 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
     if (dict[@"group_burst_max"] != nil) self.data[@"group_burst_max"] = @(MAX(1, MIN(10, [dict[@"group_burst_max"] integerValue])));
     if (dict[@"max_replies_per_hour"] != nil) self.data[@"max_replies_per_hour"] = @(MAX(5, [dict[@"max_replies_per_hour"] integerValue]));
     if (dict[@"cooldown_sec"] != nil) self.data[@"cooldown_sec"] = @(MAX(1, [dict[@"cooldown_sec"] integerValue]));
+    if (dict[@"warn_kick_threshold"] != nil) self.data[@"warn_kick_threshold"] = @(MAX(1, MIN(10, [dict[@"warn_kick_threshold"] integerValue])));
+    if (dict[@"approve_interval_min"] != nil) self.data[@"approve_interval_min"] = @(MAX(1, MIN(240, [dict[@"approve_interval_min"] integerValue])));
+    if (dict[@"approve_max_per_batch"] != nil) self.data[@"approve_max_per_batch"] = @(MAX(1, MIN(30, [dict[@"approve_max_per_batch"] integerValue])));
+    if ([dict[@"ad_evidence_logs"] isKindOfClass:[NSArray class]]) {
+        NSMutableArray *cleanEv = [NSMutableArray array];
+        for (id item in (NSArray *)dict[@"ad_evidence_logs"]) {
+            if ([item isKindOfClass:[NSDictionary class]]) {
+                [cleanEv addObject:item];
+                if (cleanEv.count >= 40) break;
+            }
+        }
+        self.data[@"ad_evidence_logs"] = cleanEv;
+    }
+    if ([dict[@"join_approval_logs"] isKindOfClass:[NSArray class]]) {
+        NSMutableArray *cleanJoin = [NSMutableArray array];
+        for (id item in (NSArray *)dict[@"join_approval_logs"]) {
+            if ([item isKindOfClass:[NSDictionary class]]) {
+                [cleanJoin addObject:item];
+                if (cleanJoin.count >= 30) break;
+            }
+        }
+        self.data[@"join_approval_logs"] = cleanJoin;
+    }
     [self saveLocked];
     [self.lock unlock];
 }
