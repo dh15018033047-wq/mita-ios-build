@@ -1,0 +1,69 @@
+#import <Foundation/Foundation.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+@interface MitaConfigStore : NSObject
+
++ (instancetype)shared;
+
+@property (nonatomic, assign) BOOL botEnabled;
+@property (nonatomic, assign) BOOL keepAliveEnabled;
+@property (nonatomic, assign) BOOL whitelistOnly;
+@property (nonatomic, assign) BOOL blockNewFriends;
+@property (nonatomic, assign) BOOL blockMarketing;
+@property (nonatomic, assign) BOOL adminWeChatControl;
+@property (nonatomic, assign) BOOL recognizeAdminInGroup;
+@property (nonatomic, assign) BOOL groupSplitBubbles;
+
+@property (nonatomic, copy) NSString *apiBaseUrl;
+@property (nonatomic, copy) NSString *apiKey;
+@property (nonatomic, copy) NSString *geminiApiKey;
+@property (nonatomic, copy) NSString *apiModel;
+@property (nonatomic, copy) NSString *pcSyncUrl;
+@property (nonatomic, copy) NSString *personaId;
+@property (nonatomic, copy) NSString *customPrompt;
+@property (nonatomic, copy) NSString *adminPin;
+@property (nonatomic, copy) NSString *groupKeywords;
+@property (nonatomic, copy) NSString *groupVibeMode;    // natural | light | lively | at_only
+@property (nonatomic, copy) NSString *groupPermMode;    // all | authorized_only | admin_only
+
+@property (nonatomic, assign) NSInteger groupBurstMin;
+@property (nonatomic, assign) NSInteger groupBurstMax;
+@property (nonatomic, assign) NSInteger maxRepliesPerHour;
+@property (nonatomic, assign) NSInteger cooldownSec;
+
+@property (nonatomic, copy) NSArray<NSString *> *adminContacts;
+@property (nonatomic, copy) NSArray<NSString *> *allowedContacts;
+@property (nonatomic, copy) NSArray<NSString *> *allowedGroups;
+@property (nonatomic, copy) NSArray<NSString *> *groupSubAdmins;
+@property (nonatomic, copy) NSArray<NSString *> *groupAuthorizedMembers;
+@property (nonatomic, copy) NSArray<NSString *> *groupMutedMembers;
+
+- (NSString *)effectiveApiKey;
+- (NSArray<NSDictionary *> *)personaPresets;
+- (NSString *)effectivePromptForContact:(NSString *)contact
+                                isGroup:(BOOL)isGroup
+                            groupSender:(NSString *)groupSender
+                              groupRole:(NSString *)groupRole;
+
+- (void)updateFromDictionary:(NSDictionary *)dict;
+- (NSDictionary *)toDictionaryRedactingKey:(BOOL)redact;
+
+- (NSArray<NSDictionary *> *)memoryForContact:(NSString *)contact;
+- (void)appendMemoryForContact:(NSString *)contact userMsg:(NSString *)uMsg botReply:(NSString *)bReply;
+- (void)clearMemoryForContact:(NSString *)contact;
+
+- (void)addEventLogKind:(NSString *)kind
+                contact:(NSString *)contact
+               incoming:(NSString *)incoming
+                 detail:(NSString *)detail
+                 costMs:(NSInteger)costMs;
+- (NSArray<NSDictionary *> *)eventLogs;
+- (void)clearLogs;
+
++ (NSString *)normalizeName:(NSString *)raw;
++ (NSArray<NSString *> *)splitCsvList:(id)val;
+
+@end
+
+NS_ASSUME_NONNULL_END

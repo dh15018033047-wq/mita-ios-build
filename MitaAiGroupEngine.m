@@ -1,0 +1,848 @@
+#import "MitaAiGroupEngine.h"
+#import "MitaConfigStore.h"
+#import "MitaKeepAliveAndControl.h"
+
+@interface MitaAiGroupEngine ()
+@property (nonatomic, strong) NSMutableArray<NSNumber *> *recentReplyTimestamps;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableDictionary *> *groupWindows;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *groupMutedUntil;
+@property (nonatomic, strong) NSLock *guardLock;
+@property (nonatomic, strong) NSURLSession *urlSession;
+@end
+
+@implementation MitaAiGroupEngine
+
++ (instancetype)shared {
+    static MitaAiGroupEngine *inst = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        inst = [[MitaAiGroupEngine alloc] init];
+    });
+    return inst;
+}
+
+- (instancetype)init {
+    if (self = [super init]) {
+        _recentReplyTimestamps = [NSMutableArray array];
+        _groupWindows = [NSMutableDictionary dictionary];
+        _groupMutedUntil = [NSMutableDictionary dictionary];
+        _guardLock = [[NSLock alloc] init];
+        NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+        cfg.timeoutIntervalForRequest = 25.0;
+        cfg.timeoutIntervalForResource = 40.0;
+        _urlSession = [NSURLSession sessionWithConfiguration:cfg];
+    }
+    return self;
+}
+
+- (NSInteger)hourlyUsedCount {
+    [self.guardLock lock];
+    NSTimeInterval cutoff = [[NSDate date] timeIntervalSince1970] - 3600.0;
+    while (self.recentReplyTimestamps.count > 0 && self.recentReplyTimestamps.firstObject.doubleValue < cutoff) {
+        [self.recentReplyTimestamps removeObjectAtIndex:0];
+    }
+    NSInteger c = (NSInteger)self.recentReplyTimestamps.count;
+    [self.guardLock unlock];
+    return c;
+}
+
+- (void)recordReplyUsage {
+    [self.guardLock lock];
+    [self.recentReplyTimestamps addObject:@([[NSDate date] timeIntervalSince1970])];
+    [self.guardLock unlock];
+}
+
+#pragma mark - Helpers
+
+- (BOOL)list:(NSArray<NSString *> *)list containsNormalized:(NSString *)target {
+    NSString *nt = [MitaConfigStore normalizeName:target];
+    if (nt.length == 0) return NO;
+    for (NSString *item in list) {
+        if ([[MitaConfigStore normalizeName:item] isEqualToString:nt]) return YES;
+    }
+    return NO;
+}
+
+- (NSString *)stripMentionPrefix:(NSString *)body {
+    NSString *s = [body stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSRegularExpression *pre = [NSRegularExpression regularExpressionWithPattern:@"^(?:\\[\\d+条\\]\\s*)?(?:\\[有人@我\\]\\s*)?(?:\\[@所有人\\]\\s*)?" options:0 error:nil];
+    s = [pre stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@""];
+    s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    NSMutableArray<NSString *> *names = [@[@"豆奶", @"米塔"] mutableCopy];
+    for (NSString *k in [MitaConfigStore splitCsvList:[MitaConfigStore shared].groupKeywords]) {
+        NSString *ck = [k stringByReplacingOccurrencesOfString:@"@" withString:@""];
+        if (ck.length > 0 && ![names containsObject:ck]) [names addObject:ck];
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        for (NSString *n in names) {
+            NSString *esc = [NSRegularExpression escapedPatternForString:n];
+            NSString *pat = [NSString stringWithFormat:@"^(?:@%@|%@)[\\u2005\\s,，:：!！~～、]*", esc, esc];
+            NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pat options:NSRegularExpressionCaseInsensitive error:nil];
+            NSTextCheckingResult *m = [re firstMatchInString:s options:0 range:NSMakeRange(0, s.length)];
+            if (m && m.range.location == 0 && m.range.length > 0) {
+                s = [[s substringFromIndex:m.range.length] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            }
+        }
+    }
+    return s;
+}
+
+- (NSString *)cleanMemberArg:(NSString *)raw {
+    NSString *s = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"^[@＠\\s]+|[\\u2005\\s,，。！!~～]+$" options:0 error:nil];
+    return [[re stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@""] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+- (void)splitGroupText:(NSString *)rawText
+         defaultSender:(NSString *)defaultSender
+             outSender:(NSString **)outSender
+               outBody:(NSString **)outBody
+               outAtMe:(BOOL *)outAtMe {
+    NSString *s = [rawText ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    BOOL atMe = [s containsString:@"[有人@我]"];
+    NSString *sender = [defaultSender ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *body = s;
+
+    if (sender.length == 0) {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"^(?:\\[\\d+条\\]\\s*)?(?:\\[有人@我\\]\\s*)?([^:：\\n]{1,22})[:：]\\s*(.+)$" options:NSRegularExpressionDotMatchesLineSeparators error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:s options:0 range:NSMakeRange(0, s.length)];
+        if (m && m.numberOfRanges >= 3) {
+            sender = [[s substringWithRange:[m rangeAtIndex:1]] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            body = [[s substringWithRange:[m rangeAtIndex:2]] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        }
+    }
+    if (outSender) *outSender = sender;
+    if (outBody) *outBody = body;
+    if (outAtMe) *outAtMe = atMe;
+}
+
+- (NSDictionary *)resolveGroupRoleForSender:(NSString *)sender body:(NSString *)body {
+    MitaConfigStore *store = [MitaConfigStore shared];
+    NSString *pin = store.adminPin;
+    BOOL pinOk = (pin.length == 0) || [body containsString:pin];
+    NSString *cleanBody = (pin.length > 0 && [body containsString:pin])
+        ? [[body stringByReplacingOccurrencesOfString:pin withString:@""] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]
+        : body;
+
+    if (store.recognizeAdminInGroup) {
+        if ([self list:store.adminContacts containsNormalized:sender]) {
+            return @{@"role": @"owner", @"is_owner": @(YES), @"is_admin": @(YES), @"pin_ok": @(pinOk), @"clean_body": cleanBody};
+        }
+        if ([self list:store.groupSubAdmins containsNormalized:sender]) {
+            return @{@"role": @"sub_admin", @"is_owner": @(NO), @"is_admin": @(YES), @"pin_ok": @(pinOk), @"clean_body": cleanBody};
+        }
+    }
+    if ([self list:store.groupMutedMembers containsNormalized:sender]) {
+        return @{@"role": @"muted", @"is_owner": @(NO), @"is_admin": @(NO), @"pin_ok": @(NO), @"clean_body": body};
+    }
+    if ([self list:store.groupAuthorizedMembers containsNormalized:sender]) {
+        return @{@"role": @"authorized", @"is_owner": @(NO), @"is_admin": @(NO), @"pin_ok": @(NO), @"clean_body": body};
+    }
+    return @{@"role": @"member", @"is_owner": @(NO), @"is_admin": @(NO), @"pin_ok": @(NO), @"clean_body": body};
+}
+
+- (BOOL)isNewFriendOrMarketing:(NSString *)text checkNewFriend:(BOOL)chkNew checkMarketing:(BOOL)chkMkt outReason:(NSString **)reason {
+    if (chkNew) {
+        NSRegularExpression *nf = [NSRegularExpression regularExpressionWithPattern:@"(以上是打招呼的内容|通过了你的朋友验证|你已添加了|现在我们可以开始聊天了|请求添加你为朋友|前往验证|添加到通讯录|对方账号存在异常|谨防诈骗)" options:0 error:nil];
+        if ([nf firstMatchInString:text options:0 range:NSMakeRange(0, text.length)]) {
+            if (reason) *reason = @"拦截新加好友/陌生人打招呼验证（哪怕同名也严禁回复）";
+            return YES;
+        }
+    }
+    if (chkMkt) {
+        NSRegularExpression *mk = [NSRegularExpression regularExpressionWithPattern:@"(砍一刀|帮我助力|淘口令|京东口令|回\\s*[TDNR]\\s*退订|限时秒杀|兼职刷单|验证码|取件码|消费提醒)" options:NSRegularExpressionCaseInsensitive error:nil];
+        if ([mk firstMatchInString:text options:0 range:NSMakeRange(0, text.length)]) {
+            if (reason) *reason = @"拦截营销推广/砍一刀/验证码通知";
+            return YES;
+        }
+    }
+    return NO;
+}
+
+- (BOOL)isPhoneControlAttempt:(NSString *)text {
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"^(?:#控机|@米塔|米塔[,，：:\\s]+|控机[,，：:\\s]+)|(?:打开|启动|切换到|切去)\\s*(?:抖音|小红书|淘宝|支付宝|美团|浏览器|safari|设置|相册|QQ)|(?:返回|回到)\\s*(?:主屏幕|桌面)" options:NSRegularExpressionCaseInsensitive error:nil];
+    return [re firstMatchInString:text options:0 range:NSMakeRange(0, text.length)] != nil;
+}
+
+#pragma mark - Evaluation & Group Admin Commands
+
+- (NSDictionary *)evaluateIncomingForContact:(NSString *)contact
+                                     isGroup:(BOOL)isGroup
+                                 groupSender:(NSString *)groupSender
+                                     rawText:(NSString *)rawText {
+    MitaConfigStore *store = [MitaConfigStore shared];
+    NSString *title = [contact ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *text = [rawText ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (title.length == 0 || text.length == 0) {
+        return @{@"allowed": @(NO), @"reason": @"空会话或空消息"};
+    }
+
+    NSString *spamReason = nil;
+    if ([self isNewFriendOrMarketing:text checkNewFriend:store.blockNewFriends checkMarketing:store.blockMarketing outReason:&spamReason]) {
+        return @{@"allowed": @(NO), @"is_group": @(isGroup), @"is_admin": @(NO), @"reason": spamReason};
+    }
+
+    if (isGroup) {
+        NSString *sender = nil;
+        NSString *body = nil;
+        BOOL atMe = NO;
+        [self splitGroupText:text defaultSender:groupSender outSender:&sender outBody:&body outAtMe:&atMe];
+        NSString *stripped = [self stripMentionPrefix:body];
+        NSDictionary *roleInfo = [self resolveGroupRoleForSender:sender body:stripped];
+        BOOL isOwner = [roleInfo[@"is_owner"] boolValue];
+        BOOL isAdmin = [roleInfo[@"is_admin"] boolValue];
+        BOOL pinOk = [roleInfo[@"pin_ok"] boolValue];
+        NSString *role = roleInfo[@"role"] ?: @"member";
+        NSString *gKey = [MitaConfigStore normalizeName:title];
+
+        // 检查本群是否处于闭麦期
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        [self.guardLock lock];
+        NSTimeInterval mutedUntil = [self.groupMutedUntil[gKey] doubleValue];
+        [self.guardLock unlock];
+        if (mutedUntil > now) {
+            BOOL isUnmute = [@[@"开麦", @"出来聊", @"出来吧", @"恢复说话", @"开启本群"] containsObject:roleInfo[@"clean_body"]];
+            if (!(isAdmin && pinOk && isUnmute)) {
+                return @{@"allowed": @(NO), @"is_group": @(YES), @"is_admin": @(isAdmin), @"group_sender": sender, @"group_role": role,
+                         @"reason": @"本群当前处于闭麦期，安静潜水中（管理员发「开麦」可随时唤醒）"};
+            }
+        }
+
+        // 检查群白名单（管理员在群内发「开启本群」可直接破冰开启）
+        BOOL inGroupWl = [self list:store.allowedGroups containsNormalized:title];
+        if (!inGroupWl) {
+            if (isAdmin && pinOk && [@[@"开启本群", @"激活本群", @"本群加白"] containsObject:roleInfo[@"clean_body"]]) {
+                return @{@"allowed": @(YES), @"is_group": @(YES), @"is_owner": @(isOwner), @"is_admin": @(YES),
+                         @"group_sender": sender, @"group_role": role, @"clean_body": roleInfo[@"clean_body"],
+                         @"reason": [NSString stringWithFormat:@"识别到管理员「%@」开启本群指令，立即放行", sender]};
+            }
+            return @{@"allowed": @(NO), @"is_group": @(YES), @"is_admin": @(isAdmin), @"group_sender": sender, @"group_role": role,
+                     @"reason": [NSString stringWithFormat:@"群聊「%@」未在允许群列表中（可在 App 添加或由管理员群内发「@豆奶 开启本群」）", title]};
+        }
+
+        // 群成员权限校验
+        if ([role isEqualToString:@"muted"]) {
+            return @{@"allowed": @(NO), @"is_group": @(YES), @"is_admin": @(NO), @"group_sender": sender, @"group_role": role,
+                     @"reason": [NSString stringWithFormat:@"群友「%@」已被管理员设为屏蔽不理", sender]};
+        }
+        NSString *permMode = store.groupPermMode;
+        if ([permMode isEqualToString:@"admin_only"] && !isAdmin) {
+            return @{@"allowed": @(NO), @"is_group": @(YES), @"is_admin": @(NO), @"group_sender": sender, @"group_role": role,
+                     @"reason": @"本群当前设为仅管理员可聊"};
+        }
+        if ([permMode isEqualToString:@"authorized_only"] && !(isAdmin || [role isEqualToString:@"authorized"])) {
+            return @{@"allowed": @(NO), @"is_group": @(YES), @"is_admin": @(NO), @"group_sender": sender, @"group_role": role,
+                     @"reason": [NSString stringWithFormat:@"本群当前仅限授权群友互动，「%@」尚未授权", sender.length ? sender : @"该群友"]};
+        }
+
+        // 判断是否 @机器人 或呼唤名字
+        NSArray<NSString *> *kws = [MitaConfigStore splitCsvList:store.groupKeywords];
+        NSString *bodyLow = [body lowercaseString];
+        BOOL hasWake = atMe;
+        for (NSString *kw in kws) {
+            NSString *kl = [[kw stringByReplacingOccurrencesOfString:@"@" withString:@""] lowercaseString];
+            if (kl.length > 0 && [bodyLow containsString:kl]) { hasWake = YES; break; }
+        }
+        if ([bodyLow containsString:@"@豆奶"] || [bodyLow containsString:@"@米塔"]) hasWake = YES;
+
+        // 判断是否在专门 @其他群友（有眼力见不乱插嘴）
+        NSRegularExpression *atRe = [NSRegularExpression regularExpressionWithPattern:@"[@＠]([^\\u2005\\s,，:：@＠]{1,20})" options:0 error:nil];
+        NSArray<NSTextCheckingResult *> *ats = [atRe matchesInString:body options:0 range:NSMakeRange(0, body.length)];
+        BOOL talkingToOthers = (ats.count > 0 && !hasWake);
+
+        // 拟人自然跟聊轮数窗口计算
+        NSInteger minT = store.groupBurstMin;
+        NSInteger maxT = store.groupBurstMax;
+        NSString *vibe = store.groupVibeMode;
+        if ([vibe isEqualToString:@"at_only"]) { minT = 1; maxT = 1; }
+        else if ([vibe isEqualToString:@"light"]) { minT = 2; maxT = 3; }
+        else if ([vibe isEqualToString:@"lively"]) { minT = 4; maxT = 5; }
+
+        [self.guardLock lock];
+        NSMutableDictionary *win = self.groupWindows[gKey];
+        NSTimeInterval started = [win[@"started_at"] doubleValue];
+        NSTimeInterval lastAt = [win[@"last_at"] doubleValue];
+        NSInteger curCnt = [win[@"count"] integerValue];
+        NSInteger targetT = [win[@"target"] integerValue];
+        BOOL winAlive = (started > 0 && (now - started) <= 180.0 && (now - lastAt) <= 90.0 && curCnt < targetT);
+
+        NSString *why = @"";
+        BOOL allowed = NO;
+        NSInteger outCur = 0;
+        NSInteger outTarget = targetT;
+
+        if (hasWake) {
+            NSInteger span = MAX(1, maxT - minT + 1);
+            outTarget = minT + (NSInteger)(arc4random_uniform((uint32_t)span));
+            outCur = 1;
+            self.groupWindows[gKey] = [@{@"started_at": @(now), @"last_at": @(now), @"count": @(1), @"target": @(outTarget)} mutableCopy];
+            allowed = YES;
+            why = [NSString stringWithFormat:@"被@或呼唤唤醒，开启自然跟聊（本波预计互动 %ld 轮）", (long)outTarget];
+        } else if (talkingToOthers) {
+            allowed = NO;
+            why = @"群友正在 @其他人 交流，模拟真人分寸感不抢话";
+        } else if (winAlive) {
+            outCur = curCnt + 1;
+            win[@"last_at"] = @(now);
+            win[@"count"] = @(outCur);
+            allowed = YES;
+            why = [NSString stringWithFormat:@"被@后顺势自然跟聊（第 %ld/%ld 轮）", (long)outCur, (long)outTarget];
+        } else {
+            allowed = NO;
+            why = (started > 0 && curCnt >= targetT)
+                ? [NSString stringWithFormat:@"刚已顺着话题自然聊完 %ld 轮，收住潜水不刷屏", (long)targetT]
+                : @"平时安静潜水不乱插嘴（被 @ 或喊名字随时开聊）";
+        }
+        [self.guardLock unlock];
+
+        return @{
+            @"allowed": @(allowed),
+            @"is_group": @(YES),
+            @"is_owner": @(isOwner),
+            @"is_admin": @(isAdmin),
+            @"group_sender": sender,
+            @"group_role": role,
+            @"clean_body": body,
+            @"current_turn": @(outCur),
+            @"target_turns": @(outTarget),
+            @"reason": why
+        };
+    }
+
+    // 私聊校验
+    BOOL isAdmin = [self list:store.adminContacts containsNormalized:title];
+    BOOL inWl = isAdmin || [self list:store.allowedContacts containsNormalized:title];
+    if (store.whitelistOnly && !inWl) {
+        return @{@"allowed": @(NO), @"is_group": @(NO), @"is_admin": @(NO), @"clean_body": text,
+                 @"reason": [NSString stringWithFormat:@"私聊联系人「%@」不在白名单中，严禁回复", title]};
+    }
+    return @{@"allowed": @(YES), @"is_group": @(NO), @"is_owner": @(isAdmin), @"is_admin": @(isAdmin),
+             @"group_sender": title, @"group_role": isAdmin ? @"owner" : @"member", @"clean_body": text,
+             @"reason": isAdmin ? @"命中唯一管理员权限核验通过" : @"命中私聊白名单（仅限纯聊天）"};
+}
+
+- (NSDictionary *)tryExecuteAdminCommandForContact:(NSString *)contact
+                                           isGroup:(BOOL)isGroup
+                                       groupSender:(NSString *)groupSender
+                                           rawText:(NSString *)rawText {
+    MitaConfigStore *store = [MitaConfigStore shared];
+    NSString *sender = groupSender ?: @"";
+    NSString *body = rawText ?: @"";
+    if (isGroup) {
+        [self splitGroupText:rawText defaultSender:groupSender outSender:&sender outBody:&body outAtMe:nil];
+    }
+    NSString *cmd = [self stripMentionPrefix:body];
+    NSDictionary *roleInfo = isGroup
+        ? [self resolveGroupRoleForSender:sender body:cmd]
+        : @{@"role": ([self list:store.adminContacts containsNormalized:contact] ? @"owner" : @"member"),
+            @"is_owner": @([self list:store.adminContacts containsNormalized:contact]),
+            @"is_admin": @([self list:store.adminContacts containsNormalized:contact]),
+            @"pin_ok": @(store.adminPin.length == 0 || [cmd containsString:store.adminPin]),
+            @"clean_body": (store.adminPin.length > 0 ? [[cmd stringByReplacingOccurrencesOfString:store.adminPin withString:@""] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] : cmd)};
+
+    BOOL isOwner = [roleInfo[@"is_owner"] boolValue] && [roleInfo[@"pin_ok"] boolValue];
+    BOOL isAdmin = [roleInfo[@"is_admin"] boolValue] && [roleInfo[@"pin_ok"] boolValue];
+    NSString *raw = [roleInfo[@"clean_body"] ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (raw.length == 0) return @{@"matched": @(NO)};
+
+    // 检测是否是群管理/调权限指令
+    NSRegularExpression *cmdCheck = [NSRegularExpression regularExpressionWithPattern:
+        @"^(?:开启本群|激活本群|本群加白|关闭本群|停用本群|闭麦|安静|开麦|出来聊|恢复说话|"
+        @"(?:给|授予|开放|加).*权限|(?:允许|授权)\\s*@?\\S+|(?:取消|收回|撤|移除).*权限|"
+        @"(?:屏蔽|拉黑|不理|别理)\\s*@?\\S+|(?:解除屏蔽|取消屏蔽|恢复|理一下)\\s*@?\\S+|"
+        @"(?:设|加|给)(?:副管|管理|协管)\\s*@?\\S+|(?:撤|取消|移除)(?:副管|管理|协管)\\s*@?\\S+|"
+        @"全群可聊|全员可聊|开放群聊|仅授权可聊|仅管理(?:员)?可聊|只理管理员|"
+        @"活跃点|多聊几句|热闹点|低调点|少聊两句|自然模式|正常聊|仅艾特回|潜水模式|"
+        @"本群权限|群权限|本群状态|查看群权限|查看权限|(?:换|切换)?人设)" options:0 error:nil];
+
+    if (![cmdCheck firstMatchInString:raw options:0 range:NSMakeRange(0, raw.length)]) {
+        return @{@"matched": @(NO)};
+    }
+
+    if (!isAdmin) {
+        return @{@"matched": @(YES), @"modified": @(NO), @"action": @"auth_rejected",
+                 @"reply": @"哈哈调权限得我们群管理发话才算数哈～"};
+    }
+
+    NSString *reply = nil;
+    NSString *action = @"group_admin_cmd";
+    BOOL modified = NO;
+    NSString *gKey = [MitaConfigStore normalizeName:contact];
+
+    if ([@[@"开启本群", @"激活本群", @"本群加白"] containsObject:raw]) {
+        NSMutableArray *grps = [store.allowedGroups mutableCopy];
+        if (![self list:grps containsNormalized:contact]) [grps addObject:contact];
+        store.allowedGroups = grps;
+        [self.guardLock lock]; [self.groupMutedUntil removeObjectForKey:gKey]; [self.guardLock unlock];
+        reply = [NSString stringWithFormat:@"收到老大，本群「%@」已开启聊天权限，随时 @我 开聊～", contact];
+        action = @"enable_current_group";
+        modified = YES;
+    } else if ([@[@"关闭本群", @"停用本群"] containsObject:raw]) {
+        NSMutableArray *grps = [NSMutableArray array];
+        for (NSString *g in store.allowedGroups) {
+            if (![[MitaConfigStore normalizeName:g] isEqualToString:gKey]) [grps addObject:g];
+        }
+        store.allowedGroups = grps;
+        reply = [NSString stringWithFormat:@"好嘞，已关闭本群「%@」的自动聊天，需要再叫我开启就行", contact];
+        action = @"disable_current_group";
+        modified = YES;
+    } else if ([raw hasPrefix:@"闭麦"] || [raw hasPrefix:@"安静"]) {
+        NSInteger mins = 30;
+        NSRegularExpression *numRe = [NSRegularExpression regularExpressionWithPattern:@"(\\d+)" options:0 error:nil];
+        NSTextCheckingResult *nm = [numRe firstMatchInString:raw options:0 range:NSMakeRange(0, raw.length)];
+        if (nm) mins = MAX(1, [[raw substringWithRange:[nm rangeAtIndex:1]] integerValue]);
+        [self.guardLock lock];
+        self.groupMutedUntil[gKey] = @([[NSDate date] timeIntervalSince1970] + mins * 60.0);
+        [self.groupWindows removeObjectForKey:gKey];
+        [self.guardLock unlock];
+        reply = [NSString stringWithFormat:@"好嘞，我先在群里安静潜水 %ld 分钟，有事随时喊我「开麦」", (long)mins];
+        action = @"mute_group";
+    } else if ([@[@"开麦", @"出来聊", @"恢复说话"] containsObject:raw]) {
+        [self.guardLock lock]; [self.groupMutedUntil removeObjectForKey:gKey]; [self.guardLock unlock];
+        reply = @"来啦来啦，随时开聊～";
+        action = @"unmute_group";
+    } else if ([@[@"全群可聊", @"全员可聊", @"开放群聊"] containsObject:raw]) {
+        store.groupPermMode = @"all";
+        reply = @"已切为【全群可聊】模式：除屏蔽名单外，大家 @我 都能一起聊";
+        modified = YES;
+    } else if ([@[@"仅授权可聊"] containsObject:raw]) {
+        store.groupPermMode = @"authorized_only";
+        reply = @"已切为【仅授权群友可聊】：只有管理员与已授权群友 @我 才会回应";
+        modified = YES;
+    } else if ([@[@"仅管理员可聊", @"仅管理可聊", @"只理管理员"] containsObject:raw]) {
+        store.groupPermMode = @"admin_only";
+        reply = @"已切为【仅管理员可聊】：群里目前只回应管理员发话";
+        modified = YES;
+    } else if ([@[@"活跃点", @"多聊几句", @"热闹点"] containsObject:raw]) {
+        store.groupVibeMode = @"lively"; store.groupBurstMin = 4; store.groupBurstMax = 5;
+        reply = @"好嘞！已切到热聊气氛组节奏，被 @ 聊开后会顺着大家多聊四五轮～";
+        modified = YES;
+    } else if ([@[@"低调点", @"少聊两句"] containsObject:raw]) {
+        store.groupVibeMode = @"light"; store.groupBurstMin = 2; store.groupBurstMax = 3;
+        reply = @"明白，已切到轻度搭话节奏，被 @ 后聊两三句就安静听大家聊";
+        modified = YES;
+    } else if ([@[@"自然模式", @"正常聊"] containsObject:raw]) {
+        store.groupVibeMode = @"natural"; store.groupBurstMin = 2; store.groupBurstMax = 5;
+        reply = @"已恢复默认拟人节奏：平时不刷屏，被 @ 后像真人一样自然跟聊几句";
+        modified = YES;
+    } else if ([@[@"仅艾特回", @"潜水模式"] containsObject:raw]) {
+        store.groupVibeMode = @"at_only"; store.groupBurstMin = 1; store.groupBurstMax = 1;
+        reply = @"好嘞，已切到深度潜水模式，只有明确 @我 那一下才回";
+        modified = YES;
+    } else if ([@[@"本群权限", @"群权限", @"本群状态", @"查看群权限", @"查看权限"] containsObject:raw]) {
+        NSDictionary *pMap = @{@"all": @"全群可聊(屏蔽除外)", @"authorized_only": @"仅授权群友可聊", @"admin_only": @"仅管理员可聊"};
+        NSDictionary *vMap = @{@"natural": @"拟人自然(2~5轮)", @"light": @"轻度搭话(2~3轮)", @"lively": @"活跃热聊(4~5轮)", @"at_only": @"潜水仅@回"};
+        NSString *subs = store.groupSubAdmins.count ? [store.groupSubAdmins componentsJoinedByString:@"、"] : @"无";
+        NSString *auths = store.groupAuthorizedMembers.count ? [store.groupAuthorizedMembers componentsJoinedByString:@"、"] : @"无";
+        NSString *mutes = store.groupMutedMembers.count ? [store.groupMutedMembers componentsJoinedByString:@"、"] : @"无";
+        reply = [NSString stringWithFormat:@"【本群权限状态】\n· 管理员：%@ | 协管：%@\n· 互动范围：%@ | 节奏：%@\n· 已授权群友：%@ | 已屏蔽：%@",
+                 [store.adminContacts componentsJoinedByString:@"、"], subs,
+                 pMap[store.groupPermMode] ?: @"全群可聊", vMap[store.groupVibeMode] ?: @"拟人自然", auths, mutes];
+        action = @"show_group_permissions";
+    } else {
+        // 成员增删与人设切换解析
+        NSRegularExpression *grantRe = [NSRegularExpression regularExpressionWithPattern:@"^(?:(?:给|授予|开放|加)\\s*(.+?)\\s*权限|(?:给|授予|开放|加)权限[：:\\s]*(.+)|(?:允许|授权)[：:\\s]*(.+))$" options:0 error:nil];
+        NSRegularExpression *revokeRe = [NSRegularExpression regularExpressionWithPattern:@"^(?:(?:取消|收回|撤|移除)\\s*(.+?)\\s*权限|(?:取消|收回|撤|移除)权限[：:\\s]*(.+))$" options:0 error:nil];
+        NSRegularExpression *muteRe = [NSRegularExpression regularExpressionWithPattern:@"^(?:屏蔽|拉黑|不理|别理)[：:\\s]*(.+)$" options:0 error:nil];
+        NSRegularExpression *unmuteRe = [NSRegularExpression regularExpressionWithPattern:@"^(?:解除屏蔽|取消屏蔽|恢复|理一下)[：:\\s]*(.+)$" options:0 error:nil];
+        NSRegularExpression *addSubRe = [NSRegularExpression regularExpressionWithPattern:@"^(?:设|加|给)(?:副管|管理|协管)[：:\\s]*(.+)$" options:0 error:nil];
+        NSRegularExpression *delSubRe = [NSRegularExpression regularExpressionWithPattern:@"^(?:撤|取消|移除)(?:副管|管理|协管)[：:\\s]*(.+)$" options:0 error:nil];
+        NSRegularExpression *persRe = [NSRegularExpression regularExpressionWithPattern:@"^(?:换|切换)?人设[：:\\s]*(.+)$" options:0 error:nil];
+
+        NSTextCheckingResult *m = nil;
+        if ((m = [grantRe firstMatchInString:raw options:0 range:NSMakeRange(0, raw.length)])) {
+            NSString *t = nil;
+            for (NSUInteger i = 1; i < m.numberOfRanges; i++) {
+                NSRange r = [m rangeAtIndex:i];
+                if (r.location != NSNotFound) { t = [self cleanMemberArg:[raw substringWithRange:r]]; break; }
+            }
+            if (t.length > 0) {
+                NSMutableArray *auth = [store.groupAuthorizedMembers mutableCopy];
+                if (![self list:auth containsNormalized:t]) [auth addObject:t];
+                store.groupAuthorizedMembers = auth;
+                NSMutableArray *mut = [NSMutableArray array];
+                for (NSString *x in store.groupMutedMembers) if (![[MitaConfigStore normalizeName:x] isEqualToString:[MitaConfigStore normalizeName:t]]) [mut addObject:x];
+                store.groupMutedMembers = mut;
+                reply = [NSString stringWithFormat:@"已给「%@」开通群聊互动权限啦，欢迎随时 @我 聊天", t];
+                modified = YES;
+            }
+        } else if ((m = [revokeRe firstMatchInString:raw options:0 range:NSMakeRange(0, raw.length)])) {
+            NSString *t = nil;
+            for (NSUInteger i = 1; i < m.numberOfRanges; i++) {
+                NSRange r = [m rangeAtIndex:i];
+                if (r.location != NSNotFound) { t = [self cleanMemberArg:[raw substringWithRange:r]]; break; }
+            }
+            if (t.length > 0) {
+                NSMutableArray *auth = [NSMutableArray array];
+                for (NSString *x in store.groupAuthorizedMembers) if (![[MitaConfigStore normalizeName:x] isEqualToString:[MitaConfigStore normalizeName:t]]) [auth addObject:x];
+                store.groupAuthorizedMembers = auth;
+                reply = [NSString stringWithFormat:@"好嘞，已收回「%@」的群聊单独授权", t];
+                modified = YES;
+            }
+        } else if ((m = [muteRe firstMatchInString:raw options:0 range:NSMakeRange(0, raw.length)])) {
+            NSString *t = [self cleanMemberArg:[raw substringWithRange:[m rangeAtIndex:1]]];
+            if (t.length > 0) {
+                if ([self list:store.adminContacts containsNormalized:t]) {
+                    reply = @"哈哈不能屏蔽最高管理员本尊哈～";
+                } else {
+                    NSMutableArray *mut = [store.groupMutedMembers mutableCopy];
+                    if (![self list:mut containsNormalized:t]) [mut addObject:t];
+                    store.groupMutedMembers = mut;
+                    reply = [NSString stringWithFormat:@"收到，已把「%@」加入本群免打扰屏蔽，后面TA @我 就不搭理了", t];
+                    modified = YES;
+                }
+            }
+        } else if ((m = [unmuteRe firstMatchInString:raw options:0 range:NSMakeRange(0, raw.length)])) {
+            NSString *t = [self cleanMemberArg:[raw substringWithRange:[m rangeAtIndex:1]]];
+            if (t.length > 0) {
+                NSMutableArray *mut = [NSMutableArray array];
+                for (NSString *x in store.groupMutedMembers) if (![[MitaConfigStore normalizeName:x] isEqualToString:[MitaConfigStore normalizeName:t]]) [mut addObject:x];
+                store.groupMutedMembers = mut;
+                reply = [NSString stringWithFormat:@"好嘞，已解除对「%@」的屏蔽，恢复正常互动", t];
+                modified = YES;
+            }
+        } else if ((m = [addSubRe firstMatchInString:raw options:0 range:NSMakeRange(0, raw.length)])) {
+            if (!isOwner) {
+                reply = @"只有最高管理员才能任命副管理员哈～";
+            } else {
+                NSString *t = [self cleanMemberArg:[raw substringWithRange:[m rangeAtIndex:1]]];
+                NSMutableArray *subs = [store.groupSubAdmins mutableCopy];
+                if (t.length > 0 && ![self list:subs containsNormalized:t]) [subs addObject:t];
+                store.groupSubAdmins = subs;
+                reply = [NSString stringWithFormat:@"已任命「%@」为群协管员，可帮忙管理群聊天权限与开关麦", t];
+                modified = YES;
+            }
+        } else if ((m = [delSubRe firstMatchInString:raw options:0 range:NSMakeRange(0, raw.length)])) {
+            if (!isOwner) {
+                reply = @"只有最高管理员才能撤销副管理员哈～";
+            } else {
+                NSString *t = [self cleanMemberArg:[raw substringWithRange:[m rangeAtIndex:1]]];
+                NSMutableArray *subs = [NSMutableArray array];
+                for (NSString *x in store.groupSubAdmins) if (![[MitaConfigStore normalizeName:x] isEqualToString:[MitaConfigStore normalizeName:t]]) [subs addObject:x];
+                store.groupSubAdmins = subs;
+                reply = [NSString stringWithFormat:@"已取消「%@」的群协管员权限", t];
+                modified = YES;
+            }
+        } else if ((m = [persRe firstMatchInString:raw options:0 range:NSMakeRange(0, raw.length)])) {
+            NSString *target = [self cleanMemberArg:[raw substringWithRange:[m rangeAtIndex:1]]];
+            for (NSDictionary *p in [store personaPresets]) {
+                if ([p[@"name"] isEqualToString:target] || [p[@"id"] isEqualToString:[target lowercaseString]]) {
+                    store.personaId = p[@"id"];
+                    store.customPrompt = p[@"prompt"];
+                    reply = [NSString stringWithFormat:@"收到，人设已切换为「%@」（%@）啦～", p[@"name"], p[@"badge"]];
+                    modified = YES;
+                    break;
+                }
+            }
+            if (!reply) reply = @"未找到该预设人设，可选：晚风、豆奶、陆离、姜姜、阿泽、沈言";
+        }
+    }
+
+    if (!reply) return @{@"matched": @(NO)};
+    if (modified) [self pushConfigToPcQuietly];
+    [store addEventLogKind:@"replied" contact:contact incoming:rawText detail:[NSString stringWithFormat:@"[群管调权限] %@", reply] costMs:2];
+    return @{@"matched": @(YES), @"modified": @(modified), @"action": action, @"reply": reply};
+}
+
+#pragma mark - OpenAI-Compatible Fast API Client
+
+- (void)chatCompletionWithMessages:(NSArray<NSDictionary *> *)messages
+                          jsonMode:(BOOL)jsonMode
+                        completion:(void (^)(BOOL ok, NSString *content, NSString *model, NSInteger costMs, NSString *error))completion {
+    MitaConfigStore *store = [MitaConfigStore shared];
+    NSString *base = store.apiBaseUrl;
+    while ([base hasSuffix:@"/"]) base = [base substringToIndex:base.length - 1];
+    NSString *apiKey = [store effectiveApiKey];
+    NSString *model = store.apiModel.length ? store.apiModel : @"gemini-3.5-flash-lite";
+    if (base.length == 0 || apiKey.length == 0) {
+        completion(NO, @"", model, 0, @"请先在「API 与双控」页填写 API 地址与密钥");
+        return;
+    }
+
+    BOOL isGrok = [[model lowercaseString] containsString:@"grok"];
+    NSArray<NSDictionary *> *sendMsgs = messages;
+    if (isGrok) {
+        NSMutableString *sysBuf = [NSMutableString string];
+        NSMutableArray *rest = [NSMutableArray array];
+        for (NSDictionary *item in messages) {
+            if ([item[@"role"] isEqualToString:@"system"]) {
+                if (sysBuf.length > 0) [sysBuf appendString:@"\n\n"];
+                [sysBuf appendString:(item[@"content"] ?: @"")];
+            } else {
+                [rest addObject:[item mutableCopy]];
+            }
+        }
+        if (sysBuf.length > 0) {
+            NSString *prefix = [NSString stringWithFormat:@"【请直接遵守以下设定并快速给出自然回复】\n%@\n\n---\n", sysBuf];
+            if (rest.count > 0 && [rest[0][@"role"] isEqualToString:@"user"]) {
+                rest[0][@"content"] = [prefix stringByAppendingString:(rest[0][@"content"] ?: @"")];
+            } else {
+                [rest insertObject:[@{@"role": @"user", @"content": prefix} mutableCopy] atIndex:0];
+            }
+            sendMsgs = rest;
+        }
+    }
+
+    NSMutableDictionary *payload = [@{
+        @"model": model,
+        @"messages": sendMsgs,
+        @"stream": @(NO),
+        @"max_tokens": @(jsonMode ? 480 : 320)
+    } mutableCopy];
+    if (isGrok) payload[@"reasoning_effort"] = @"minimal";
+    if (jsonMode) payload[@"response_format"] = @{@"type": @"json_object"};
+
+    NSURL *url = [NSURL URLWithString:[base stringByAppendingString:@"/chat/completions"]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    [req setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+    [req setValue:[NSString stringWithFormat:@"Bearer %@", apiKey] forHTTPHeaderField:@"Authorization"];
+    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+
+    NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+    [[self.urlSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        NSInteger costMs = (NSInteger)llround(([[NSDate date] timeIntervalSince1970] - t0) * 1000.0);
+        if (err || !data) {
+            completion(NO, @"", model, costMs, err.localizedDescription ?: @"网络连接失败");
+            return;
+        }
+        NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)resp;
+        NSInteger code = httpResp.statusCode;
+        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (code < 200 || code >= 300 || ![obj isKindOfClass:[NSDictionary class]]) {
+            NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+            if (raw.length > 140) raw = [[raw substringToIndex:140] stringByAppendingString:@"..."];
+            completion(NO, @"", model, costMs, [NSString stringWithFormat:@"HTTP %ld: %@", (long)code, raw]);
+            return;
+        }
+        NSArray *choices = obj[@"choices"];
+        NSString *txt = (choices.count > 0) ? (choices[0][@"message"][@"content"] ?: @"") : @"";
+        txt = [txt stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (jsonMode && [txt hasPrefix:@"```"]) {
+            NSRegularExpression *fence1 = [NSRegularExpression regularExpressionWithPattern:@"^```(?:json)?\\s*" options:0 error:nil];
+            NSRegularExpression *fence2 = [NSRegularExpression regularExpressionWithPattern:@"\\s*```$" options:0 error:nil];
+            txt = [fence1 stringByReplacingMatchesInString:txt options:0 range:NSMakeRange(0, txt.length) withTemplate:@""];
+            txt = [fence2 stringByReplacingMatchesInString:txt options:0 range:NSMakeRange(0, txt.length) withTemplate:@""];
+        }
+        NSString *usedModel = obj[@"model"] ?: model;
+        if (txt.length == 0) {
+            completion(NO, @"", usedModel, costMs, @"模型返回内容为空");
+            return;
+        }
+        completion(YES, txt, usedModel, costMs, @"");
+    }] resume];
+}
+
+- (void)generateWeChatReplyForContact:(NSString *)contact
+                              isGroup:(BOOL)isGroup
+                          groupSender:(NSString *)groupSender
+                             incoming:(NSString *)incoming
+                           completion:(void (^)(NSDictionary *result))completion {
+    MitaConfigStore *store = [MitaConfigStore shared];
+    NSDictionary *guard = [self evaluateIncomingForContact:contact isGroup:isGroup groupSender:groupSender rawText:incoming];
+    BOOL allowed = [guard[@"allowed"] boolValue];
+    BOOL isAdmin = [guard[@"is_admin"] boolValue];
+    NSString *effSender = guard[@"group_sender"] ?: groupSender ?: @"";
+    NSString *effRole = guard[@"group_role"] ?: @"member";
+    NSString *cleanBody = guard[@"clean_body"] ?: incoming;
+
+    if (!allowed) {
+        [store addEventLogKind:@"blocked" contact:contact incoming:incoming detail:(guard[@"reason"] ?: @"已拦截") costMs:1];
+        completion(@{
+            @"ok": @(YES),
+            @"blocked": @(YES),
+            @"guard_allowed": @(NO),
+            @"is_admin": @(isAdmin),
+            @"guard_reason": guard[@"reason"] ?: @"",
+            @"reply": [NSString stringWithFormat:@"【未回复 · 原因】%@", guard[@"reason"] ?: @""],
+            @"cost_ms": @(1)
+        });
+        return;
+    }
+
+    // 优先检查是否为群内管理员调权限/管群口令
+    NSDictionary *cmdRes = [self tryExecuteAdminCommandForContact:contact isGroup:isGroup groupSender:effSender rawText:incoming];
+    if ([cmdRes[@"matched"] boolValue]) {
+        completion(@{
+            @"ok": @(YES),
+            @"blocked": @([cmdRes[@"action"] isEqualToString:@"auth_rejected"]),
+            @"is_command": @(YES),
+            @"is_admin": @(isAdmin),
+            @"guard_reason": guard[@"reason"] ?: @"",
+            @"reply": cmdRes[@"reply"] ?: @"",
+            @"cost_ms": @(2)
+        });
+        return;
+    }
+
+    // 非管理员严禁跨应用控机
+    if (!isAdmin && [self isPhoneControlAttempt:cleanBody]) {
+        NSString *deny = @"哈哈我只在这陪大家聊天哈，手机里的其他软件只有管理员自己才能动～";
+        [store addEventLogKind:@"blocked" contact:contact incoming:incoming detail:@"权限硬隔离：拦截非管理员跨软件控机" costMs:1];
+        completion(@{@"ok": @(YES), @"blocked": @(YES), @"is_admin": @(NO), @"reply": deny, @"cost_ms": @(1)});
+        return;
+    }
+
+    NSString *sysPrompt = [store effectivePromptForContact:contact isGroup:isGroup groupSender:effSender groupRole:effRole];
+    NSMutableArray *msgs = [NSMutableArray array];
+    [msgs addObject:@{@"role": @"system", @"content": sysPrompt}];
+    [msgs addObjectsFromArray:[store memoryForContact:contact]];
+    NSString *userLine = (isGroup && effSender.length > 0)
+        ? [NSString stringWithFormat:@"%@: %@", effSender, cleanBody]
+        : cleanBody;
+    [msgs addObject:@{@"role": @"user", @"content": userLine}];
+
+    [self chatCompletionWithMessages:msgs jsonMode:NO completion:^(BOOL ok, NSString *content, NSString *model, NSInteger costMs, NSString *error) {
+        if (!ok) {
+            completion(@{@"ok": @(NO), @"error": error, @"model": model, @"cost_ms": @(costMs)});
+            return;
+        }
+        NSRegularExpression *keyRed = [NSRegularExpression regularExpressionWithPattern:@"\\bsk-[A-Za-z0-9_-]{14,}\\b" options:0 error:nil];
+        NSString *clean = [keyRed stringByReplacingMatchesInString:content options:0 range:NSMakeRange(0, content.length) withTemplate:@"[密钥已隐藏]"];
+        [self recordReplyUsage];
+        [store appendMemoryForContact:contact userMsg:userLine botReply:clean];
+        [store addEventLogKind:@"replied" contact:contact incoming:userLine detail:clean costMs:costMs];
+        completion(@{
+            @"ok": @(YES),
+            @"blocked": @(NO),
+            @"is_admin": @(isAdmin),
+            @"group_role": effRole,
+            @"guard_reason": guard[@"reason"] ?: @"",
+            @"reply": clean,
+            @"model": model,
+            @"cost_ms": @(costMs)
+        });
+    }];
+}
+
+- (void)planPhoneControlOrChat:(NSString *)userText completion:(void (^)(NSDictionary *result))completion {
+    NSString *sysPrompt =
+        @"你是运行在用户巨魔版 iPhone 内的「米塔 手机智能体」。请根据用户输入直接输出一个合法 JSON 对象，不写多余说明：\n"
+        @"{\"reply\": \"自然简短的中文答复\", \"actions\": [ ... ]}\n"
+        @"规则：\n"
+        @"1. 若用户只是日常聊天提问（不需要操作手机），actions 返回空数组 []。\n"
+        @"2. 若用户要求操控苹果手机（如打开微信、Safari、抖音、小红书、设置、滑屏、回主屏幕等），规划简洁动作放进 actions 数组（最多 5 步）：\n"
+        @"   - {\"type\":\"launch_app\", \"app\":\"微信|设置|浏览器|抖音|小红书|淘宝|支付宝|QQ|巨魔\"}\n"
+        @"   - {\"type\":\"open_url\", \"url\":\"https://...\"}\n"
+        @"   - {\"type\":\"tap\", \"x\":0.5, \"y\":0.5}\n"
+        @"   - {\"type\":\"swipe\", \"dir\":\"up|down|left|right\"}\n"
+        @"   - {\"type\":\"home\"}\n"
+        @"   - {\"type\":\"input_text\", \"text\":\"要写入剪贴板的文字\"}\n"
+        @"   - {\"type\":\"wait\", \"ms\":500}";
+
+    NSArray *msgs = @[
+        @{@"role": @"system", @"content": sysPrompt},
+        @{@"role": @"user", @"content": userText ?: @""}
+    ];
+    [self chatCompletionWithMessages:msgs jsonMode:YES completion:^(BOOL ok, NSString *content, NSString *model, NSInteger costMs, NSString *error) {
+        if (!ok) {
+            completion(@{@"ok": @(NO), @"error": error, @"model": model, @"cost_ms": @(costMs)});
+            return;
+        }
+        NSString *reply = content;
+        NSArray *actions = @[];
+        NSData *jdata = [content dataUsingEncoding:NSUTF8StringEncoding];
+        id parsed = jdata ? [NSJSONSerialization JSONObjectWithData:jdata options:0 error:nil] : nil;
+        if ([parsed isKindOfClass:[NSDictionary class]]) {
+            if ([parsed[@"reply"] isKindOfClass:[NSString class]]) reply = parsed[@"reply"];
+            if ([parsed[@"actions"] isKindOfClass:[NSArray class]]) actions = parsed[@"actions"];
+        }
+        NSArray *steps = @[];
+        if (actions.count > 0) {
+            steps = [[MitaKeepAliveAndControl shared] executeActionBatch:actions];
+        }
+        [[MitaConfigStore shared] addEventLogKind:@"agent" contact:@"苹果对话控机" incoming:userText detail:reply costMs:costMs];
+        completion(@{
+            @"ok": @(YES),
+            @"reply": reply,
+            @"model": model,
+            @"cost_ms": @(costMs),
+            @"steps": steps
+        });
+    }];
+}
+
+- (void)fetchModelsWithBaseUrl:(NSString *)baseUrl apiKey:(NSString *)apiKey completion:(void (^)(NSDictionary *result))completion {
+    MitaConfigStore *store = [MitaConfigStore shared];
+    NSString *base = (baseUrl.length > 0 ? baseUrl : store.apiBaseUrl);
+    while ([base hasSuffix:@"/"]) base = [base substringToIndex:base.length - 1];
+    NSString *key = (apiKey.length > 0 && ![apiKey containsString:@"****"]) ? apiKey : [store effectiveApiKey];
+    NSURL *url = [NSURL URLWithString:[base stringByAppendingString:@"/models"]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    if (key.length > 0) [req setValue:[NSString stringWithFormat:@"Bearer %@", key] forHTTPHeaderField:@"Authorization"];
+    [[self.urlSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        if (err || !data) {
+            completion(@{@"ok": @(NO), @"error": err.localizedDescription ?: @"网络错误"});
+            return;
+        }
+        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        NSMutableArray *out = [NSMutableArray array];
+        if ([obj isKindOfClass:[NSDictionary class]] && [obj[@"data"] isKindOfClass:[NSArray class]]) {
+            for (NSDictionary *row in obj[@"data"]) {
+                NSString *mid = row[@"id"];
+                NSString *low = [mid lowercaseString];
+                if (mid.length > 0 && ![low containsString:@"gpt"] && ![low containsString:@"image"] && ![low containsString:@"flux"] && ![low containsString:@"dall"]) {
+                    [out addObject:mid];
+                }
+            }
+        }
+        completion(@{@"ok": @(YES), @"models": out});
+    }] resume];
+}
+
+#pragma mark - Two-Way PC Sync
+
+- (void)syncWithPcDirection:(NSString *)direction completion:(void (^)(NSDictionary *result))completion {
+    MitaConfigStore *store = [MitaConfigStore shared];
+    NSString *pc = store.pcSyncUrl;
+    while ([pc hasSuffix:@"/"]) pc = [pc substringToIndex:pc.length - 1];
+    if (pc.length == 0) {
+        completion(@{@"ok": @(NO), @"error": @"请先填写电脑控制台地址"});
+        return;
+    }
+    NSURL *url = [NSURL URLWithString:[pc stringByAppendingString:@"/api/phone_agent/config"]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.timeoutInterval = 5.0;
+
+    if ([[direction lowercaseString] isEqualToString:@"pull"]) {
+        req.HTTPMethod = @"GET";
+        [[self.urlSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            if (err || !data) {
+                completion(@{@"ok": @(NO), @"error": @"未连上电脑端（手机独立运行不受影响）"});
+                return;
+            }
+            id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            if ([obj isKindOfClass:[NSDictionary class]]) {
+                NSDictionary *cfg = [obj[@"config"] isKindOfClass:[NSDictionary class]] ? obj[@"config"] : obj;
+                [store updateFromDictionary:cfg];
+                completion(@{@"ok": @(YES), @"message": @"已从电脑端同步最新 API、人设、白名单与群聊权限配置"});
+            } else {
+                completion(@{@"ok": @(NO), @"error": @"电脑端返回格式异常"});
+            }
+        }] resume];
+    } else {
+        req.HTTPMethod = @"POST";
+        [req setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+        NSMutableDictionary *payload = [[store toDictionaryRedactingKey:NO] mutableCopy];
+        payload[@"platform"] = @"ios";
+        payload[@"device_ip"] = [MitaKeepAliveAndControl deviceLanIPv4];
+        payload[@"lan_port"] = @(19080);
+        req.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+        [[self.urlSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            if (err) {
+                completion(@{@"ok": @(NO), @"error": @"推送失败（电脑端未开启，手机本地已保存）"});
+                return;
+            }
+            completion(@{@"ok": @(YES), @"message": @"已将苹果端最新微信/群聊权限配置推送同步到电脑"});
+        }] resume];
+    }
+}
+
+- (void)pushConfigToPcQuietly {
+    NSString *pc = [MitaConfigStore shared].pcSyncUrl;
+    if (pc.length < 8) return;
+    [self syncWithPcDirection:@"push" completion:^(NSDictionary *result) {}];
+}
+
+@end
