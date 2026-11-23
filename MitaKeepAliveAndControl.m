@@ -472,6 +472,10 @@ static BOOL sendKey(int fd, uint8_t down, uint32_t keysym) {
     return ok;
 }
 
+static void releaseVncFbBytes(void *info, const void *data, size_t size) {
+    if (data) free((void *)data);
+}
+
 - (nullable UIImage *)captureLocalVncScreenImage {
     [self.vncLock lock];
     int w = 0, h = 0;
@@ -573,9 +577,7 @@ static BOOL sendKey(int fd, uint8_t down, uint32_t keysym) {
     }
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, fb, bufSize, ^(void *info, const void *data, size_t size) {
-        free((void *)data);
-    });
+    CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, fb, bufSize, releaseVncFbBytes);
     CGImageRef cgImg = CGImageCreate(
         w, h, 8, 32, stride, cs,
         kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
