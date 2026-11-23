@@ -20,10 +20,15 @@ jobs:
             -framework Foundation \
             -framework WebKit \
             -framework AVFoundation \
+            -framework AVKit \
             -framework CoreGraphics \
+            -framework CoreMedia \
+            -framework CoreVideo \
+            -framework Vision \
+            -lz \
             main.m AppDelegate.m MainViewController.m \
             MitaConfigStore.m MitaKeepAliveAndControl.m \
-            MitaAiGroupEngine.m MitaLanServer.m \
+            MitaFloatingHudManager.m MitaAiGroupEngine.m MitaLanServer.m \
             -o MitaPhoneAgent_arm64
           file MitaPhoneAgent_arm64
           otool -L MitaPhoneAgent_arm64

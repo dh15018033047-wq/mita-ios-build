@@ -67,9 +67,9 @@
         @"platform": @"ios",
         @"app": @"MitaPhoneAgent",
         @"app_title": @"米塔 手机智能体 (巨魔版)",
-        @"version": @"2.7.0",
+        @"version": @"2.8.0",
         @"model": [MitaKeepAliveAndControl deviceModelName],
-        @"ios_version": [UIDevice currentDevice].systemVersion ?: @"15.7.9",
+        @"ios_version": [UIDevice currentDevice].systemVersion ?: @"15.8.2",
         @"width": @((int)nb.size.width),
         @"height": @((int)nb.size.height),
         @"ip": [MitaKeepAliveAndControl deviceLanIPv4],
@@ -78,6 +78,9 @@
         @"acc_ready": @(YES),
         @"notif_ready": @(YES),
         @"bot_enabled": @(store.botEnabled),
+        @"bot_running": @([MitaAiGroupEngine shared].isAutoReplyRunning),
+        @"floating_hud_enabled": @(store.floatingHudEnabled),
+        @"runtime_monitor": [[MitaAiGroupEngine shared] runtimeStatusSnapshot],
         @"whitelist_only": @(store.whitelistOnly),
         @"persona_id": store.personaId,
         @"api_model": store.apiModel,
@@ -227,6 +230,11 @@
         d[@"ok"] = @(YES);
         d[@"status"] = [self buildPingPayload];
         respObj = d;
+    } else if ([path isEqualToString:@"/toggle_bot"] && [method isEqualToString:@"POST"]) {
+        id inObj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : @{};
+        NSDictionary *dict = [inObj isKindOfClass:[NSDictionary class]] ? inObj : @{};
+        BOOL wantRun = dict[@"running"] ? [dict[@"running"] boolValue] : YES;
+        respObj = [[MitaAiGroupEngine shared] setAutoReplyRunning:wantRun launchWeChat:NO triggerSource:@"pc_remote"];
     } else if ([path isEqualToString:@"/action"] && [method isEqualToString:@"POST"]) {
         id inObj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : @{};
         NSDictionary *act = [inObj isKindOfClass:[NSDictionary class]] ? inObj : @{};

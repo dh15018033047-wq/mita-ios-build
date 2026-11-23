@@ -3,6 +3,7 @@
 #import "MitaKeepAliveAndControl.h"
 #import "MitaAiGroupEngine.h"
 #import "MitaLanServer.h"
+#import "MitaFloatingHudManager.h"
 #import <WebKit/WebKit.h>
 
 @interface MainViewController () <WKScriptMessageHandler, WKUIDelegate, WKNavigationDelegate>
@@ -20,14 +21,13 @@
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor colorWithRed:0.965 green:0.969 blue:0.976 alpha:1.0];
+    self.view.backgroundColor = [UIColor colorWithRed:0.949 green:0.949 blue:0.969 alpha:1.0];
 
     WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
     cfg.allowsInlineMediaPlayback = YES;
     WKUserContentController *ucc = [[WKUserContentController alloc] init];
     [ucc addScriptMessageHandler:self name:@"mitaAsync"];
 
-    // 在页面加载前注入与前端 100% 兼容的原生 window.MikaBridge 对象
     NSString *bridgeJs =
         @"window.MikaBridge = {\n"
         @"  _sync: function(op, arg) {\n"
@@ -37,6 +37,10 @@
         @"  saveConfig: function(jsonStr) { return this._sync('saveConfig', jsonStr); },\n"
         @"  clearLogs: function() { return this._sync('clearLogs', ''); },\n"
         @"  openPermission: function(kind) { return this._sync('openPermission', kind); },\n"
+        @"  controlFloatingHud: function(mode) { return this._sync('controlFloatingHud', mode || 'toggle'); },\n"
+        @"  toggleAutoReply: function(reqId, running, launchWechat) {\n"
+        @"    window.webkit.messageHandlers.mitaAsync.postMessage({method:'toggleAutoReply', reqId:reqId, args:[Boolean(running), Boolean(launchWechat)]});\n"
+        @"  },\n"
         @"  sendAgentMessage: function(reqId, text) {\n"
         @"    window.webkit.messageHandlers.mitaAsync.postMessage({method:'sendAgentMessage', reqId:reqId, args:[text || '']});\n"
         @"  },\n"
@@ -62,9 +66,12 @@
     self.webView.UIDelegate = self;
     self.webView.navigationDelegate = self;
     self.webView.scrollView.bounces = YES;
-    self.webView.opaque = NO;
+    self.webView.opaque = YES;
     self.webView.backgroundColor = self.view.backgroundColor;
     [self.view addSubview:self.webView];
+
+    // 挂载 iOS 15 跨应用画中画全局悬浮框底层宿主层（位于 WebView 底下，零视觉干扰）
+    [[MitaFloatingHudManager shared] attachToHostView:self.view];
 
     NSURL *htmlUrl = [[NSBundle mainBundle] URLForResource:@"index" withExtension:@"html"];
     if (htmlUrl) {
@@ -86,10 +93,14 @@
     d[@"device_ip"] = ip;
     d[@"lan_endpoint"] = [NSString stringWithFormat:@"http://%@:%d", ip, [MitaLanServer shared].listenPort];
     d[@"device_model"] = [MitaKeepAliveAndControl deviceModelName];
-    d[@"ios_version"] = [UIDevice currentDevice].systemVersion ?: @"15.7.9";
+    d[@"ios_version"] = [UIDevice currentDevice].systemVersion ?: @"15.8.2";
     d[@"keep_alive_running"] = @([MitaKeepAliveAndControl shared].isKeepAliveRunning);
     d[@"troll_signed"] = @(YES);
     d[@"hourly_used"] = @([[MitaAiGroupEngine shared] hourlyUsedCount]);
+    d[@"bot_running"] = @([MitaAiGroupEngine shared].isAutoReplyRunning);
+    d[@"floating_hud_supported"] = @([MitaFloatingHudManager shared].isSupported);
+    d[@"floating_hud_active"] = @([MitaFloatingHudManager shared].isActive);
+    d[@"runtime_monitor"] = [[MitaAiGroupEngine shared] runtimeStatusSnapshot];
     NSData *j = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
     return j ? [[NSString alloc] initWithData:j encoding:NSUTF8StringEncoding] : @"{}";
 }
@@ -127,12 +138,37 @@ completionHandler:(void (^)(NSString * _Nullable))completionHandler {
             NSDictionary *patch = ad ? [NSJSONSerialization JSONObjectWithData:ad options:0 error:nil] : nil;
             if ([patch isKindOfClass:[NSDictionary class]]) {
                 [[MitaConfigStore shared] updateFromDictionary:patch];
-                if ([MitaConfigStore shared].keepAliveEnabled) {
+                if ([MitaConfigStore shared].keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning) {
                     [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
                 } else {
                     [[MitaKeepAliveAndControl shared] stopSilentKeepAlive];
                 }
+                if (patch[@"floating_hud_enabled"] != nil) {
+                    if (![MitaConfigStore shared].floatingHudEnabled) {
+                        [[MitaFloatingHudManager shared] stopFloatingWindow];
+                    } else {
+                        [[MitaFloatingHudManager shared] syncPlaybackState];
+                    }
+                }
                 [[MitaAiGroupEngine shared] pushConfigToPcQuietly];
+            }
+            NSString *st = [self buildFullStateJsonString];
+            completionHandler([NSString stringWithFormat:@"{\"ok\":true,\"state\":%@}", st]);
+            return;
+        }
+        if ([op isEqualToString:@"controlFloatingHud"]) {
+            if ([arg isEqualToString:@"start"]) {
+                [MitaConfigStore shared].floatingHudEnabled = YES;
+                [[MitaFloatingHudManager shared] startFloatingWindow];
+            } else if ([arg isEqualToString:@"stop"]) {
+                [[MitaFloatingHudManager shared] stopFloatingWindow];
+            } else {
+                if ([MitaFloatingHudManager shared].isActive) {
+                    [[MitaFloatingHudManager shared] stopFloatingWindow];
+                } else {
+                    [MitaConfigStore shared].floatingHudEnabled = YES;
+                    [[MitaFloatingHudManager shared] startFloatingWindow];
+                }
             }
             NSString *st = [self buildFullStateJsonString];
             completionHandler([NSString stringWithFormat:@"{\"ok\":true,\"state\":%@}", st]);
@@ -175,7 +211,16 @@ completionHandler:(void (^)(NSString * _Nullable))completionHandler {
     NSArray *args = [body[@"args"] isKindOfClass:[NSArray class]] ? body[@"args"] : @[];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        if ([method isEqualToString:@"sendAgentMessage"]) {
+        if ([method isEqualToString:@"toggleAutoReply"]) {
+            BOOL wantRun = args.count > 0 ? [args[0] boolValue] : YES;
+            BOOL openWx = args.count > 1 ? [args[1] boolValue] : NO;
+            NSDictionary *res = [[MitaAiGroupEngine shared] setAutoReplyRunning:wantRun launchWeChat:openWx triggerSource:@"app_button"];
+            NSMutableDictionary *out = [res mutableCopy];
+            NSData *stData = [[self buildFullStateJsonString] dataUsingEncoding:NSUTF8StringEncoding];
+            id stObj = stData ? [NSJSONSerialization JSONObjectWithData:stData options:0 error:nil] : nil;
+            if (stObj) out[@"state"] = stObj;
+            [self emitAsyncCallback:reqId payload:out];
+        } else if ([method isEqualToString:@"sendAgentMessage"]) {
             NSString *txt = args.count > 0 ? [args[0] description] : @"";
             [[MitaAiGroupEngine shared] planPhoneControlOrChat:txt completion:^(NSDictionary *res) {
                 [self emitAsyncCallback:reqId payload:res];

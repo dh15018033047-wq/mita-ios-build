@@ -6,6 +6,14 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (instancetype)shared;
 
+@property (nonatomic, readonly) BOOL isAutoReplyRunning;
+
+- (void)bootstrapRuntimeIfNeeded;
+- (NSDictionary *)runtimeStatusSnapshot;
+- (NSDictionary *)setAutoReplyRunning:(BOOL)running
+                         launchWeChat:(BOOL)launchWx
+                        triggerSource:(NSString *)source;
+
 - (NSInteger)hourlyUsedCount;
 
 // 核心校验：私聊防乱回 + 群聊真人自然跟聊 + 群内管理员身份识别

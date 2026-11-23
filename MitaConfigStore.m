@@ -95,6 +95,8 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
 
     NSMutableDictionary *defaults = [@{
         @"bot_enabled": @(YES),
+        @"bot_running": @(NO),
+        @"floating_hud_enabled": @(YES),
         @"keep_alive_enabled": @(YES),
         @"whitelist_only": @(YES),
         @"block_new_friends": @(YES),
@@ -197,6 +199,12 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
 
 - (BOOL)botEnabled { [self.lock lock]; BOOL v = [self.data[@"bot_enabled"] boolValue]; [self.lock unlock]; return v; }
 - (void)setBotEnabled:(BOOL)v { [self.lock lock]; self.data[@"bot_enabled"] = @(v); [self saveLocked]; [self.lock unlock]; }
+
+- (BOOL)botRunning { [self.lock lock]; BOOL v = self.data[@"bot_running"] ? [self.data[@"bot_running"] boolValue] : NO; [self.lock unlock]; return v; }
+- (void)setBotRunning:(BOOL)v { [self.lock lock]; self.data[@"bot_running"] = @(v); [self saveLocked]; [self.lock unlock]; }
+
+- (BOOL)floatingHudEnabled { [self.lock lock]; BOOL v = self.data[@"floating_hud_enabled"] ? [self.data[@"floating_hud_enabled"] boolValue] : YES; [self.lock unlock]; return v; }
+- (void)setFloatingHudEnabled:(BOOL)v { [self.lock lock]; self.data[@"floating_hud_enabled"] = @(v); [self saveLocked]; [self.lock unlock]; }
 
 - (BOOL)keepAliveEnabled { [self.lock lock]; BOOL v = [self.data[@"keep_alive_enabled"] boolValue]; [self.lock unlock]; return v; }
 - (void)setKeepAliveEnabled:(BOOL)v { [self.lock lock]; self.data[@"keep_alive_enabled"] = @(v); [self saveLocked]; [self.lock unlock]; }
@@ -413,7 +421,7 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
     if (![dict isKindOfClass:[NSDictionary class]]) return;
     [self.lock lock];
     NSArray *boolKeys = @[
-        @"bot_enabled", @"keep_alive_enabled", @"whitelist_only", @"block_new_friends",
+        @"bot_enabled", @"bot_running", @"floating_hud_enabled", @"keep_alive_enabled", @"whitelist_only", @"block_new_friends",
         @"block_marketing", @"admin_wechat_control", @"recognize_admin_in_group", @"verify_admin_avatar_wxid",
         @"group_split_bubbles", @"ad_guard_enabled", @"auto_kick_enabled", @"auto_approve_join_enabled"
     ];

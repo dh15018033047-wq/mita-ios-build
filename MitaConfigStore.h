@@ -7,6 +7,8 @@ NS_ASSUME_NONNULL_BEGIN
 + (instancetype)shared;
 
 @property (nonatomic, assign) BOOL botEnabled;
+@property (nonatomic, assign) BOOL botRunning;
+@property (nonatomic, assign) BOOL floatingHudEnabled;
 @property (nonatomic, assign) BOOL keepAliveEnabled;
 @property (nonatomic, assign) BOOL whitelistOnly;
 @property (nonatomic, assign) BOOL blockNewFriends;

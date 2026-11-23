@@ -1,13 +1,26 @@
 #import "MitaAiGroupEngine.h"
 #import "MitaConfigStore.h"
 #import "MitaKeepAliveAndControl.h"
+#import "MitaFloatingHudManager.h"
+#import <UIKit/UIKit.h>
+#import <Vision/Vision.h>
 
 @interface MitaAiGroupEngine ()
 @property (nonatomic, strong) NSMutableArray<NSNumber *> *recentReplyTimestamps;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableDictionary *> *groupWindows;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *groupMutedUntil;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *lastRepliedSignatures;
 @property (nonatomic, strong) NSLock *guardLock;
 @property (nonatomic, strong) NSURLSession *urlSession;
+@property (nonatomic, strong) dispatch_source_t patrolTimer;
+@property (nonatomic, assign, readwrite) BOOL isAutoReplyRunning;
+@property (nonatomic, assign) BOOL patrolBusy;
+@property (nonatomic, assign) NSTimeInterval startedAtTs;
+@property (nonatomic, assign) NSInteger totalRepliedCount;
+@property (nonatomic, copy) NSString *monitorPhase;
+@property (nonatomic, copy) NSString *monitorEngineMode;
+@property (nonatomic, copy) NSString *monitorLastContact;
+@property (nonatomic, copy) NSString *monitorStatusLine;
 @end
 
 @implementation MitaAiGroupEngine
@@ -26,7 +39,16 @@
         _recentReplyTimestamps = [NSMutableArray array];
         _groupWindows = [NSMutableDictionary dictionary];
         _groupMutedUntil = [NSMutableDictionary dictionary];
+        _lastRepliedSignatures = [NSMutableDictionary dictionary];
         _guardLock = [[NSLock alloc] init];
+        _isAutoReplyRunning = NO;
+        _patrolBusy = NO;
+        _startedAtTs = 0;
+        _totalRepliedCount = 0;
+        _monitorPhase = @"idle";
+        _monitorEngineMode = @"待命未启动";
+        _monitorLastContact = @"";
+        _monitorStatusLine = @"点击下方「立即启动微信自动回复」开始运行";
         NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
         cfg.timeoutIntervalForRequest = 25.0;
         cfg.timeoutIntervalForResource = 40.0;
@@ -911,6 +933,512 @@
     NSString *pc = [MitaConfigStore shared].pcSyncUrl;
     if (pc.length < 8) return;
     [self syncWithPcDirection:@"push" completion:^(NSDictionary *result) {}];
+}
+
+#pragma mark - Auto-Reply Master Runtime & Standalone Vision Patrol Engine
+
+- (void)bootstrapRuntimeIfNeeded {
+    [self ensurePatrolTimerStarted];
+    MitaConfigStore *store = [MitaConfigStore shared];
+    if (store.botRunning) {
+        [self setAutoReplyRunning:YES launchWeChat:NO triggerSource:@"bootstrap"];
+    } else {
+        [[MitaFloatingHudManager shared] updateWithRunning:NO
+                                                     phase:@"idle"
+                                                     model:store.apiModel
+                                              repliedCount:self.totalRepliedCount
+                                                statusLine:self.monitorStatusLine];
+    }
+}
+
+- (void)ensurePatrolTimerStarted {
+    if (self.patrolTimer) return;
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    self.patrolTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    dispatch_source_set_timer(self.patrolTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                              (uint64_t)(2.4 * NSEC_PER_SEC),
+                              (uint64_t)(0.3 * NSEC_PER_SEC));
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(self.patrolTimer, ^{
+        [weakSelf patrolLoopTick];
+    });
+    dispatch_resume(self.patrolTimer);
+}
+
+- (void)updateRuntimePhase:(NSString *)phase
+                engineMode:(NSString *)engineMode
+               lastContact:(NSString *)contact
+                statusLine:(NSString *)line
+              repliedCount:(NSInteger)repCnt {
+    [self.guardLock lock];
+    if (phase.length > 0) self.monitorPhase = phase;
+    if (engineMode.length > 0) self.monitorEngineMode = engineMode;
+    if (contact != nil) self.monitorLastContact = contact;
+    if (line.length > 0) self.monitorStatusLine = line;
+    if (repCnt >= 0) self.totalRepliedCount = repCnt;
+    BOOL running = self.isAutoReplyRunning;
+    NSString *pCopy = self.monitorPhase ?: @"idle";
+    NSString *sCopy = self.monitorStatusLine ?: @"";
+    NSInteger cCopy = self.totalRepliedCount;
+    [self.guardLock unlock];
+
+    NSString *model = [MitaConfigStore shared].apiModel ?: @"grok-4.7";
+    [[MitaFloatingHudManager shared] updateWithRunning:running
+                                                 phase:pCopy
+                                                 model:model
+                                          repliedCount:cCopy
+                                            statusLine:sCopy];
+}
+
+- (NSDictionary *)runtimeStatusSnapshot {
+    [self.guardLock lock];
+    BOOL running = self.isAutoReplyRunning;
+    NSTimeInterval upSec = (running && self.startedAtTs > 0) ? MAX(0, [[NSDate date] timeIntervalSince1970] - self.startedAtTs) : 0;
+    NSDictionary *snap = @{
+        @"running": @(running),
+        @"uptime_sec": @((NSInteger)llround(upSec)),
+        @"phase": self.monitorPhase ?: @"idle",
+        @"engine_mode": self.monitorEngineMode ?: (running ? @"正在连接引擎" : @"待命未启动"),
+        @"last_contact": self.monitorLastContact ?: @"",
+        @"last_message": self.monitorStatusLine ?: @"",
+        @"replied_count": @(self.totalRepliedCount),
+        @"model": [MitaConfigStore shared].apiModel ?: @"grok-4.7"
+    };
+    [self.guardLock unlock];
+    return snap;
+}
+
+- (NSDictionary *)setAutoReplyRunning:(BOOL)running
+                         launchWeChat:(BOOL)launchWx
+                        triggerSource:(NSString *)source {
+    [self ensurePatrolTimerStarted];
+    MitaConfigStore *store = [MitaConfigStore shared];
+    store.botRunning = running;
+    if (running) {
+        store.botEnabled = YES;
+        [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
+    }
+
+    [self.guardLock lock];
+    self.isAutoReplyRunning = running;
+    if (running && self.startedAtTs <= 0) {
+        self.startedAtTs = [[NSDate date] timeIntervalSince1970];
+    } else if (!running) {
+        self.startedAtTs = 0;
+    }
+    [self.guardLock unlock];
+
+    if (running) {
+        [self updateRuntimePhase:@"patrolling"
+                      engineMode:@"正在启动巡检"
+                     lastContact:self.monitorLastContact ?: @""
+                      statusLine:@"已启动！正在连接 API 并监听微信白名单未读消息…"
+                    repliedCount:self.totalRepliedCount];
+        if (store.floatingHudEnabled) {
+            [[MitaFloatingHudManager shared] syncPlaybackState];
+        }
+    } else {
+        [self updateRuntimePhase:@"idle"
+                      engineMode:@"已停止"
+                     lastContact:self.monitorLastContact ?: @""
+                      statusLine:@"已停止自动回复，点击主按钮可随时重新启动"
+                    repliedCount:self.totalRepliedCount];
+    }
+
+    // 同步通知电脑端开启或停止高速巡检守护（除非本次调用本身就是电脑端反向推过来的）
+    if (![source isEqualToString:@"pc_remote"]) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            [self notifyPcToggleRunning:running];
+            [self pushConfigToPcQuietly];
+        });
+    }
+
+    if (running && launchWx) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (store.floatingHudEnabled) {
+                [[MitaFloatingHudManager shared] startFloatingWindow];
+            }
+            [[MitaKeepAliveAndControl shared] launchAppByNameOrBundleId:@"com.tencent.xin"];
+        });
+    }
+
+    return @{
+        @"ok": @(YES),
+        @"bot_running": @(running),
+        @"runtime_monitor": [self runtimeStatusSnapshot],
+        @"message": running ? @"微信自动回复已启动运行" : @"微信自动回复已停止"
+    };
+}
+
+- (void)notifyPcToggleRunning:(BOOL)running {
+    NSString *pc = [MitaConfigStore shared].pcSyncUrl;
+    while ([pc hasSuffix:@"/"]) pc = [pc substringToIndex:pc.length - 1];
+    if (pc.length < 8) return;
+    NSURL *u = [NSURL URLWithString:[pc stringByAppendingString:@"/api/wechat/bot/toggle"]];
+    if (!u) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
+    req.HTTPMethod = @"POST";
+    req.timeoutInterval = 2.5;
+    [req setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+    NSDictionary *body = @{@"running": @(running), @"from_phone": @(YES)};
+    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    [[self.urlSession dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {}] resume];
+}
+
+- (BOOL)syncFromPcActiveMonitorIfOnline {
+    NSString *pc = [MitaConfigStore shared].pcSyncUrl;
+    while ([pc hasSuffix:@"/"]) pc = [pc substringToIndex:pc.length - 1];
+    if (pc.length < 8) return NO;
+    NSURL *u = [NSURL URLWithString:[pc stringByAppendingString:@"/api/wechat/bot/state"]];
+    if (!u) return NO;
+
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
+    req.HTTPMethod = @"GET";
+    req.timeoutInterval = 1.6;
+
+    __block NSDictionary *respDict = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [[self.urlSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        if (!err && data) {
+            id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            if ([obj isKindOfClass:[NSDictionary class]]) respDict = (NSDictionary *)obj;
+        }
+        dispatch_semaphore_signal(sem);
+    }] resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)));
+
+    if (!respDict || ![respDict[@"ok"] boolValue] || ![respDict[@"phone_connected"] boolValue]) {
+        return NO;
+    }
+
+    BOOL pcRunning = [respDict[@"running"] boolValue];
+    if (!pcRunning && self.isAutoReplyRunning) {
+        [self notifyPcToggleRunning:YES];
+    }
+
+    NSDictionary *mon = [respDict[@"monitor"] isKindOfClass:[NSDictionary class]] ? respDict[@"monitor"] : @{};
+    NSString *phase = [mon[@"phase"] isKindOfClass:[NSString class]] ? mon[@"phase"] : @"patrolling";
+    NSString *lastMsg = [mon[@"last_message"] isKindOfClass:[NSString class]] ? mon[@"last_message"] : @"正在监听微信白名单消息…";
+    NSString *lastContact = [mon[@"last_contact"] isKindOfClass:[NSString class]] ? mon[@"last_contact"] : @"";
+    NSInteger repCnt = mon[@"replied_count"] ? [mon[@"replied_count"] integerValue] : self.totalRepliedCount;
+
+    [self updateRuntimePhase:phase
+                  engineMode:@"双端协同高速引擎"
+                 lastContact:lastContact
+                  statusLine:lastMsg
+                repliedCount:MAX(self.totalRepliedCount, repCnt)];
+    return YES;
+}
+
+#pragma mark - Standalone Local Vision WeChat Patrol (Runs Even When PC Is Off)
+
+- (NSArray<NSNumber *> *)scanRedBadgesInImage:(CGImageRef)cgImg
+                                           x0:(double)x0 x1:(double)x1
+                                           y0:(double)y0 y1:(double)y1 {
+    if (!cgImg) return @[];
+    const int sw = 180, sh = 320;
+    uint8_t *px = (uint8_t *)calloc(1, sw * sh * 4);
+    if (!px) return @[];
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(px, sw, sh, 8, sw * 4, cs, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, sw, sh), cgImg);
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+
+    int xa = MAX(0, (int)(sw * x0)), xb = MIN(sw - 1, (int)(sw * x1));
+    int ya = MAX(0, (int)(sh * y0)), yb = MIN(sh - 1, (int)(sh * y1));
+    NSMutableArray<NSNumber *> *redRows = [NSMutableArray array];
+    for (int y = ya; y <= yb; y++) {
+        int cnt = 0;
+        for (int x = xa; x <= xb; x++) {
+            int off = (y * sw + x) * 4;
+            int r = px[off], g = px[off + 1], b = px[off + 2];
+            if (r >= 205 && g <= 100 && b <= 100 && (r - g) >= 115 && (r - b) >= 115) cnt++;
+        }
+        if (cnt >= 2) [redRows addObject:@(y)];
+    }
+    free(px);
+    if (redRows.count == 0) return @[];
+
+    NSMutableArray<NSNumber *> *centers = [NSMutableArray array];
+    int startY = redRows[0].intValue, prevY = startY;
+    for (NSUInteger i = 1; i < redRows.count; i++) {
+        int curY = redRows[i].intValue;
+        if (curY - prevY <= 3) {
+            prevY = curY;
+        } else {
+            if (prevY - startY + 1 >= 2) [centers addObject:@(((startY + prevY) * 0.5) / sh)];
+            startY = prevY = curY;
+        }
+    }
+    if (prevY - startY + 1 >= 2) [centers addObject:@(((startY + prevY) * 0.5) / sh)];
+    return centers;
+}
+
+- (BOOL)hasGreenBubbleInImage:(CGImageRef)cgImg y0:(double)y0 y1:(double)y1 {
+    if (!cgImg || y1 <= y0) return NO;
+    const int sw = 160, sh = 320;
+    uint8_t *px = (uint8_t *)calloc(1, sw * sh * 4);
+    if (!px) return NO;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(px, sw, sh, 8, sw * 4, cs, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, sw, sh), cgImg);
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+
+    int xa = (int)(sw * 0.36), xb = (int)(sw * 0.87);
+    int ya = MAX(0, (int)(sh * MAX(0.12, y0))), yb = MIN(sh - 1, (int)(sh * MIN(0.91, y1)));
+    int greenPx = 0;
+    for (int y = ya; y <= yb; y++) {
+        for (int x = xa; x <= xb; x++) {
+            int off = (y * sw + x) * 4;
+            int r = px[off], g = px[off + 1], b = px[off + 2];
+            BOOL lightG = (g >= 195 && r >= 110 && r <= 185 && b >= 70 && b <= 145 && (g - r) >= 35 && (g - b) >= 65);
+            BOOL darkG = (g >= 135 && r <= 95 && b <= 135 && (g - r) >= 55 && (g - b) >= 25);
+            if (lightG || darkG) greenPx++;
+        }
+    }
+    free(px);
+    int area = MAX(1, (yb - ya + 1) * (xb - xa));
+    return (greenPx >= 14) && ((double)greenPx / (double)area >= 0.035);
+}
+
+- (void)patrolLoopTick {
+    if (!self.isAutoReplyRunning || self.patrolBusy) return;
+    self.patrolBusy = YES;
+
+    @try {
+        // 1. 若同一 Wi-Fi 下电脑端在线且已连手机，优先单主协同并实时镜像状态到手机与悬浮框
+        if ([self syncFromPcActiveMonitorIfOnline]) {
+            self.patrolBusy = NO;
+            return;
+        }
+
+        // 2. 电脑端未开或离线：手机本机独立通过 TrollVNC(127.0.0.1:5901) + Vision 中文 OCR 巡检微信
+        UIImage *screen = [[MitaKeepAliveAndControl shared] captureLocalVncScreenImage];
+        if (!screen || !screen.CGImage) {
+            [self updateRuntimePhase:@"waiting_frame"
+                          engineMode:@"巨魔本机独立引擎"
+                         lastContact:self.monitorLastContact ?: @""
+                          statusLine:@"等待本机 TrollVNC (5901) 屏幕通道就绪…"
+                        repliedCount:self.totalRepliedCount];
+            self.patrolBusy = NO;
+            return;
+        }
+
+        CGImageRef cgImg = screen.CGImage;
+        NSMutableArray<NSDictionary *> *ocrLines = [NSMutableArray array];
+        if (@available(iOS 15.0, *)) {
+            VNRecognizeTextRequest *ocrReq = [[VNRecognizeTextRequest alloc] init];
+            ocrReq.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+            ocrReq.recognitionLanguages = @[@"zh-Hans", @"en-US"];
+            ocrReq.usesLanguageCorrection = NO;
+            VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cgImg options:@{}];
+            [handler performRequests:@[ocrReq] error:nil];
+            for (VNRecognizedTextObservation *obs in ocrReq.results) {
+                VNRecognizedText *cand = [[obs topCandidates:1] firstObject];
+                if (!cand || cand.string.length == 0) continue;
+                CGRect bb = obs.boundingBox; // 原点在左下角
+                double x0 = bb.origin.x;
+                double x1 = bb.origin.x + bb.size.width;
+                double y0 = 1.0 - (bb.origin.y + bb.size.height);
+                double y1 = 1.0 - bb.origin.y;
+                [ocrLines addObject:@{
+                    @"t": [cand.string stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]],
+                    @"x0": @(x0), @"x1": @(x1), @"y0": @(y0), @"y1": @(y1),
+                    @"cx": @((x0 + x1) * 0.5), @"cy": @((y0 + y1) * 0.5)
+                }];
+            }
+        }
+
+        [ocrLines sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            double ya = [a[@"cy"] doubleValue], yb = [b[@"cy"] doubleValue];
+            if (fabs(ya - yb) > 0.015) return ya < yb ? NSOrderedAscending : NSOrderedDescending;
+            return [a[@"x0"] doubleValue] < [b[@"x0"] doubleValue] ? NSOrderedAscending : NSOrderedDescending;
+        }];
+
+        NSMutableString *fullTxt = [NSMutableString string];
+        NSMutableString *bottomTxt = [NSMutableString string];
+        NSMutableArray<NSDictionary *> *topLines = [NSMutableArray array];
+        for (NSDictionary *ln in ocrLines) {
+            NSString *t = ln[@"t"];
+            double cy = [ln[@"cy"] doubleValue], x0 = [ln[@"x0"] doubleValue];
+            [fullTxt appendFormat:@"%@\n", t];
+            if (cy >= 0.89) [bottomTxt appendFormat:@"%@ ", t];
+            if (cy >= 0.038 && cy <= 0.118 && x0 >= 0.04 && x0 <= 0.76) [topLines addObject:ln];
+        }
+
+        int navHits = 0;
+        for (NSString *kw in @[@"微信", @"通讯录", @"发现", @"我"]) {
+            if ([bottomTxt containsString:kw]) navHits++;
+        }
+        NSString *topJoined = [[topLines valueForKey:@"t"] componentsJoinedByString:@" "];
+
+        // 情况 A：存在微信底部四栏
+        if (navHits >= 2) {
+            BOOL onHomeList = ([topJoined containsString:@"微信"] || (![topJoined containsString:@"通讯录"] && ![topJoined containsString:@"发现"]));
+            if (!onHomeList) {
+                NSArray<NSNumber *> *tabBadge = [self scanRedBadgesInImage:cgImg x0:0.06 x1:0.24 y0:0.89 y1:0.96];
+                if (tabBadge.count > 0) {
+                    [[MitaKeepAliveAndControl shared] vncTapNormX:0.125 normY:0.955];
+                    [self updateRuntimePhase:@"patrolling" engineMode:@"巨魔本机独立引擎" lastContact:@"" statusLine:@"发现微信图标未读红点，已自动切回微信消息列表" repliedCount:self.totalRepliedCount];
+                } else {
+                    [self updateRuntimePhase:@"watching" engineMode:@"巨魔本机独立引擎" lastContact:@"" statusLine:@"当前在微信子标签页，静默监听未读红点…" repliedCount:self.totalRepliedCount];
+                }
+                self.patrolBusy = NO;
+                return;
+            }
+
+            // 扫描首页列表未读红点
+            NSArray<NSNumber *> *redYs = [self scanRedBadgesInImage:cgImg x0:0.08 x1:0.25 y0:0.135 y1:0.865];
+            for (NSNumber *ryNum in redYs) {
+                double ry = ryNum.doubleValue;
+                NSMutableArray<NSDictionary *> *rowLns = [NSMutableArray array];
+                for (NSDictionary *ln in ocrLines) {
+                    double cy = [ln[@"cy"] doubleValue], x0 = [ln[@"x0"] doubleValue];
+                    if (x0 >= 0.16 && x0 <= 0.72 && cy >= (ry - 0.022) && cy <= (ry + 0.072)) {
+                        [rowLns addObject:ln];
+                    }
+                }
+                if (rowLns.count == 0) continue;
+                NSString *cTitle = rowLns[0][@"t"];
+                NSRegularExpression *tmRe = [NSRegularExpression regularExpressionWithPattern:@"\\s*\\d{1,2}:\\d{2}\\s*$" options:0 error:nil];
+                cTitle = [[tmRe stringByReplacingMatchesInString:cTitle options:0 range:NSMakeRange(0, cTitle.length) withTemplate:@""] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                if (cTitle.length == 0) continue;
+                BOOL isGrp = ([cTitle containsString:@"("] || [cTitle containsString:@"（"]);
+                NSString *preview = rowLns.count > 1 ? rowLns[1][@"t"] : @"你好";
+                NSDictionary *ev = [self evaluateIncomingForContact:cTitle isGroup:isGrp groupSender:@"" rawText:preview];
+                if ([ev[@"allowed"] boolValue]) {
+                    double tapY = MIN(0.84, MAX(0.16, ry + 0.018));
+                    [[MitaKeepAliveAndControl shared] vncTapNormX:0.48 normY:tapY];
+                    [self updateRuntimePhase:@"entering"
+                                  engineMode:@"巨魔本机独立引擎"
+                                 lastContact:cTitle
+                                  statusLine:[NSString stringWithFormat:@"发现白名单「%@」未读消息，正在进入会话…", cTitle]
+                                repliedCount:self.totalRepliedCount];
+                    self.patrolBusy = NO;
+                    return;
+                }
+            }
+            [self updateRuntimePhase:@"patrolling"
+                          engineMode:@"巨魔本机独立引擎"
+                         lastContact:@""
+                          statusLine:@"正在微信首页实时监听白名单未读消息…"
+                        repliedCount:self.totalRepliedCount];
+            self.patrolBusy = NO;
+            return;
+        }
+
+        // 情况 B：具体微信聊天窗口
+        NSMutableArray<NSString *> *tParts = [NSMutableArray array];
+        for (NSDictionary *ln in topLines) {
+            NSString *t = ln[@"t"];
+            t = [t stringByReplacingOccurrencesOfString:@"<" withString:@""];
+            t = [t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if (t.length > 0 && [ln[@"x0"] doubleValue] <= 0.70 && ![t containsString:@":"]) {
+                [tParts addObject:t];
+            }
+        }
+        NSString *contactTitle = [tParts componentsJoinedByString:@" "];
+        if (contactTitle.length == 0) {
+            [self updateRuntimePhase:@"watching" engineMode:@"巨魔本机独立引擎" lastContact:@"" statusLine:@"当前不在微信聊天窗口，后台静默守护中…" repliedCount:self.totalRepliedCount];
+            self.patrolBusy = NO;
+            return;
+        }
+
+        NSString *spamReason = nil;
+        if ([self isNewFriendOrMarketing:fullTxt checkNewFriend:[MitaConfigStore shared].blockNewFriends checkMarketing:NO outReason:&spamReason]) {
+            [self updateRuntimePhase:@"watching" engineMode:@"巨魔本机独立引擎" lastContact:contactTitle statusLine:spamReason repliedCount:self.totalRepliedCount];
+            self.patrolBusy = NO;
+            return;
+        }
+
+        BOOL isGrp = ([contactTitle containsString:@"("] || [contactTitle containsString:@"（"]);
+        NSMutableArray<NSDictionary *> *msgLines = [NSMutableArray array];
+        for (NSDictionary *ln in ocrLines) {
+            double cy = [ln[@"cy"] doubleValue];
+            NSString *t = ln[@"t"];
+            if (cy >= 0.13 && cy <= 0.895 && ![t containsString:@"撤回了一条消息"]) {
+                BOOL inGreen = [self hasGreenBubbleInImage:cgImg y0:([ln[@"y0"] doubleValue] - 0.008) y1:([ln[@"y1"] doubleValue] + 0.008)];
+                double x0 = [ln[@"x0"] doubleValue], x1 = [ln[@"x1"] doubleValue];
+                NSString *role = @"peer";
+                if (inGreen || (x0 > 0.44 && x1 > 0.74)) role = @"self";
+                else if (x0 >= 0.26 && x1 <= 0.74 && fabs((x0 + x1) * 0.5 - 0.5) < 0.07) role = @"system";
+                else if (x0 <= 0.38) role = @"peer";
+                else role = ([ln[@"cx"] doubleValue] > 0.54) ? @"self" : @"peer";
+                if (![role isEqualToString:@"system"]) {
+                    [msgLines addObject:@{@"t": t, @"role": role, @"y0": ln[@"y0"], @"y1": ln[@"y1"]}];
+                }
+            }
+        }
+
+        if (msgLines.count == 0 || ![msgLines.lastObject[@"role"] isEqualToString:@"peer"]) {
+            [self updateRuntimePhase:@"watching"
+                          engineMode:@"巨魔本机独立引擎"
+                         lastContact:contactTitle
+                          statusLine:[NSString stringWithFormat:@"正在守候「%@」会话，等待对方新消息…", contactTitle]
+                        repliedCount:self.totalRepliedCount];
+            self.patrolBusy = NO;
+            return;
+        }
+
+        if ([self hasGreenBubbleInImage:cgImg y0:([msgLines.lastObject[@"y1"] doubleValue] + 0.012) y1:0.90]) {
+            self.patrolBusy = NO;
+            return;
+        }
+
+        NSString *incoming = msgLines.lastObject[@"t"];
+        NSString *sig = [NSString stringWithFormat:@"%@|%@", contactTitle, incoming];
+        [self.guardLock lock];
+        NSString *prevSig = self.lastRepliedSignatures[contactTitle];
+        [self.guardLock unlock];
+        if ([prevSig isEqualToString:sig]) {
+            [self updateRuntimePhase:@"watching" engineMode:@"巨魔本机独立引擎" lastContact:contactTitle statusLine:[NSString stringWithFormat:@"「%@」最新消息已回复，持续监听中…", contactTitle] repliedCount:self.totalRepliedCount];
+            self.patrolBusy = NO;
+            return;
+        }
+
+        NSDictionary *adm = [self evaluateIncomingForContact:contactTitle isGroup:isGrp groupSender:@"" rawText:incoming];
+        if (![adm[@"allowed"] boolValue]) {
+            [self updateRuntimePhase:@"watching" engineMode:@"巨魔本机独立引擎" lastContact:contactTitle statusLine:(adm[@"reason"] ?: @"未命中白名单，保持沉默") repliedCount:self.totalRepliedCount];
+            self.patrolBusy = NO;
+            return;
+        }
+
+        [self updateRuntimePhase:@"replying"
+                      engineMode:@"巨魔本机独立引擎"
+                     lastContact:contactTitle
+                      statusLine:[NSString stringWithFormat:@"收到「%@」：%@ → 正在调用 API 生成回复…", contactTitle, incoming]
+                    repliedCount:self.totalRepliedCount];
+
+        __block NSDictionary *genRes = nil;
+        dispatch_semaphore_t genSem = dispatch_semaphore_create(0);
+        [self generateWeChatReplyForContact:contactTitle isGroup:isGrp groupSender:@"" incoming:incoming completion:^(NSDictionary *result) {
+            genRes = result;
+            dispatch_semaphore_signal(genSem);
+        }];
+        dispatch_semaphore_wait(genSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(28.0 * NSEC_PER_SEC)));
+
+        NSString *replyTxt = [genRes[@"reply"] isKindOfClass:[NSString class]] ? genRes[@"reply"] : @"";
+        if ([genRes[@"ok"] boolValue] && ![genRes[@"blocked"] boolValue] && replyTxt.length > 0 && self.isAutoReplyRunning) {
+            usleep(1100000); // 1.1s 拟人打字停顿
+            BOOL sent = [[MitaKeepAliveAndControl shared] vncTypeAndSendWeChatText:replyTxt autoSend:YES];
+            if (sent) {
+                [self.guardLock lock];
+                self.lastRepliedSignatures[contactTitle] = sig;
+                NSInteger nextCnt = self.totalRepliedCount + 1;
+                [self.guardLock unlock];
+                [self updateRuntimePhase:@"replied"
+                              engineMode:@"巨魔本机独立引擎"
+                             lastContact:contactTitle
+                              statusLine:[NSString stringWithFormat:@"已回复「%@」：%@", contactTitle, replyTxt]
+                            repliedCount:nextCnt];
+            }
+        }
+    } @catch (NSException *ex) {
+    }
+    self.patrolBusy = NO;
 }
 
 @end

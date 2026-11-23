@@ -9,6 +9,7 @@
 #import <net/if.h>
 #import <sys/utsname.h>
 #import <unistd.h>
+#import <zlib.h>
 
 @interface MitaKeepAliveAndControl ()
 @property (nonatomic, strong) AVAudioPlayer *silentPlayer;
@@ -391,6 +392,202 @@ static BOOL sendKey(int fd, uint8_t down, uint32_t keysym) {
     return ok;
 }
 
+- (BOOL)vncTypeAndSendWeChatText:(NSString *)text autoSend:(BOOL)autoSend {
+    NSString *clean = [text ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (clean.length == 0) return NO;
+    // 1. 直接通过巨魔后台剪贴板特权同步写入系统 UIPasteboard
+    if ([NSThread isMainThread]) {
+        [UIPasteboard generalPasteboard].string = clean;
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            [UIPasteboard generalPasteboard].string = clean;
+        });
+    }
+
+    [self.vncLock lock];
+    int w = 0, h = 0;
+    int fd = [self connectLocalRfbAndHandshake:&w height:&h];
+    if (fd < 0) { [self.vncLock unlock]; return NO; }
+
+    // 协商 ExtendedClipboard 以双保险同步 UTF-8 剪贴板
+    int32_t encs[2] = { htonl(0), (int32_t)htonl((uint32_t)(-1063131698)) };
+    uint8_t encHdr[4] = { 2, 0, 0, 2 };
+    writeExact(fd, encHdr, 4);
+    writeExact(fd, encs, sizeof(encs));
+
+    NSData *utf8 = [clean dataUsingEncoding:NSUTF8StringEncoding];
+    if (utf8.length > 0) {
+        uint32_t rawLen = htonl((uint32_t)utf8.length + 1);
+        NSMutableData *rawClip = [NSMutableData dataWithCapacity:4 + utf8.length + 1];
+        [rawClip appendBytes:&rawLen length:4];
+        [rawClip appendData:utf8];
+        uint8_t nul = 0;
+        [rawClip appendBytes:&nul length:1];
+
+        uLongf compCap = compressBound((uLong)rawClip.length);
+        NSMutableData *compBuf = [NSMutableData dataWithLength:compCap];
+        if (compress((Bytef *)compBuf.mutableBytes, &compCap, (const Bytef *)rawClip.bytes, (uLong)rawClip.length) == Z_OK) {
+            uint32_t flags = htonl((1U << 0) | (1U << 24));
+            NSMutableData *extPayload = [NSMutableData dataWithCapacity:4 + compCap];
+            [extPayload appendBytes:&flags length:4];
+            [extPayload appendBytes:compBuf.bytes length:compCap];
+            int32_t negLen = (int32_t)htonl((uint32_t)(-((int32_t)extPayload.length)));
+            uint8_t cutHdr[4] = { 6, 0, 0, 0 };
+            writeExact(fd, cutHdr, 4);
+            writeExact(fd, &negLen, 4);
+            writeExact(fd, extPayload.bytes, extPayload.length);
+        }
+    }
+
+    // 2. 轻点微信底部聊天输入框聚焦 (x=0.47, y=0.953)
+    uint16_t ix = (uint16_t)llround(0.47 * w);
+    uint16_t iy = (uint16_t)llround(0.953 * h);
+    sendPointer(fd, 0, ix, iy);
+    usleep(8000);
+    sendPointer(fd, 1, ix, iy);
+    usleep(52000);
+    sendPointer(fd, 0, ix, iy);
+    usleep(320000);
+
+    // 3. 发送硬件组合键 Command(Super_L 0xFFEB) + v 粘贴正文
+    sendKey(fd, 1, 0xFFEB);
+    usleep(30000);
+    sendKey(fd, 1, 'v');
+    usleep(30000);
+    sendKey(fd, 0, 'v');
+    usleep(30000);
+    sendKey(fd, 0, 0xFFEB);
+    usleep(180000);
+
+    // 4. 发送 Return (0xFF0D) 完成微信消息发送
+    BOOL ok = YES;
+    if (autoSend) {
+        ok = sendKey(fd, 1, 0xFF0D);
+        usleep(35000);
+        ok = ok && sendKey(fd, 0, 0xFF0D);
+        usleep(80000);
+    }
+    close(fd);
+    [self.vncLock unlock];
+    return ok;
+}
+
+- (nullable UIImage *)captureLocalVncScreenImage {
+    [self.vncLock lock];
+    int w = 0, h = 0;
+    int fd = [self connectLocalRfbAndHandshake:&w height:&h];
+    if (fd < 0 || w <= 0 || h <= 0 || w > 3000 || h > 4000) {
+        if (fd >= 0) close(fd);
+        [self.vncLock unlock];
+        return nil;
+    }
+
+    // 1. SetPixelFormat: 32bpp little-endian BGRX (与 CGBitmapByteOrder32Little | NoneSkipFirst 完美对应)
+    uint8_t pf[20] = {
+        0, 0, 0, 0,
+        32, 24, 0, 1,
+        0, 255, 0, 255, 0, 255,
+        16, 8, 0,
+        0, 0, 0
+    };
+    // 2. SetEncodings: 仅请求 Raw (0)，本机回环零压缩最快
+    uint8_t enc[8] = { 2, 0, 0, 1, 0, 0, 0, 0 };
+    // 3. FramebufferUpdateRequest (incremental=0, 0, 0, w, h)
+    uint8_t req[10] = {
+        3, 0,
+        0, 0, 0, 0,
+        (uint8_t)((w >> 8) & 0xFF), (uint8_t)(w & 0xFF),
+        (uint8_t)((h >> 8) & 0xFF), (uint8_t)(h & 0xFF)
+    };
+    if (!writeExact(fd, pf, 20) || !writeExact(fd, enc, 8) || !writeExact(fd, req, 10)) {
+        close(fd);
+        [self.vncLock unlock];
+        return nil;
+    }
+
+    size_t stride = (size_t)w * 4;
+    size_t bufSize = stride * (size_t)h;
+    uint8_t *fb = (uint8_t *)calloc(1, bufSize);
+    if (!fb) {
+        close(fd);
+        [self.vncLock unlock];
+        return nil;
+    }
+
+    BOOL gotFrame = NO;
+    for (int msgGuard = 0; msgGuard < 8 && !gotFrame; msgGuard++) {
+        uint8_t msgType = 255;
+        if (readExact(fd, &msgType, 1) != 1) break;
+        if (msgType == 0) { // FramebufferUpdate
+            uint8_t padAndCnt[3];
+            if (readExact(fd, padAndCnt, 3) != 3) break;
+            uint16_t nRects = ((uint16_t)padAndCnt[1] << 8) | padAndCnt[2];
+            BOOL rectOk = YES;
+            for (uint16_t i = 0; i < nRects; i++) {
+                uint8_t rh[12];
+                if (readExact(fd, rh, 12) != 12) { rectOk = NO; break; }
+                uint16_t rx = ((uint16_t)rh[0] << 8) | rh[1];
+                uint16_t ry = ((uint16_t)rh[2] << 8) | rh[3];
+                uint16_t rw = ((uint16_t)rh[4] << 8) | rh[5];
+                uint16_t rhgt = ((uint16_t)rh[6] << 8) | rh[7];
+                int32_t rEnc = (int32_t)(((uint32_t)rh[8] << 24) | ((uint32_t)rh[9] << 16) | ((uint32_t)rh[10] << 8) | rh[11]);
+                if (rEnc != 0 || rx + rw > w || ry + rhgt > h) { rectOk = NO; break; }
+                if (rx == 0 && rw == w) {
+                    if (readExact(fd, fb + (size_t)ry * stride, (size_t)rhgt * stride) != (ssize_t)((size_t)rhgt * stride)) {
+                        rectOk = NO; break;
+                    }
+                } else {
+                    size_t rowBytes = (size_t)rw * 4;
+                    for (uint16_t row = 0; row < rhgt; row++) {
+                        uint8_t *dst = fb + ((size_t)(ry + row) * stride) + ((size_t)rx * 4);
+                        if (readExact(fd, dst, rowBytes) != (ssize_t)rowBytes) { rectOk = NO; break; }
+                    }
+                }
+            }
+            gotFrame = rectOk;
+        } else if (msgType == 2) { // Bell
+            continue;
+        } else if (msgType == 3) { // ServerCutText
+            uint8_t pad[3];
+            int32_t netLen = 0;
+            if (readExact(fd, pad, 3) != 3 || readExact(fd, &netLen, 4) != 4) break;
+            int32_t clen = (int32_t)ntohl((uint32_t)netLen);
+            size_t skip = (size_t)(clen < 0 ? -clen : clen);
+            uint8_t dump[1024];
+            while (skip > 0) {
+                size_t chunk = skip < sizeof(dump) ? skip : sizeof(dump);
+                if (readExact(fd, dump, chunk) != (ssize_t)chunk) { skip = 1; break; }
+                skip -= chunk;
+            }
+            if (skip != 0) break;
+        } else {
+            break;
+        }
+    }
+    close(fd);
+    [self.vncLock unlock];
+
+    if (!gotFrame) {
+        free(fb);
+        return nil;
+    }
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, fb, bufSize, ^(void *info, const void *data, size_t size) {
+        free((void *)data);
+    });
+    CGImageRef cgImg = CGImageCreate(
+        w, h, 8, 32, stride, cs,
+        kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
+        provider, NULL, false, kCGRenderingIntentDefault
+    );
+    UIImage *img = cgImg ? [UIImage imageWithCGImage:cgImg] : nil;
+    if (cgImg) CGImageRelease(cgImg);
+    if (provider) CGDataProviderRelease(provider);
+    if (cs) CGColorSpaceRelease(cs);
+    return img;
+}
+
 - (NSArray<NSDictionary *> *)executeActionBatch:(NSArray<NSDictionary *> *)actions {
     NSMutableArray *results = [NSMutableArray array];
     if (![actions isKindOfClass:[NSArray class]]) return results;
@@ -429,6 +626,11 @@ static BOOL sendKey(int fd, uint8_t down, uint32_t keysym) {
             NSString *txt = act[@"text"] ?: @"";
             ok = [self vncSendClipboardText:txt];
             desc = [NSString stringWithFormat:@"写入剪贴板：%@", txt];
+        } else if ([tp isEqualToString:@"wechat_send"]) {
+            NSString *txt = act[@"text"] ?: @"";
+            BOOL autoSnd = act[@"auto_send"] ? [act[@"auto_send"] boolValue] : YES;
+            ok = [self vncTypeAndSendWeChatText:txt autoSend:autoSnd];
+            desc = [NSString stringWithFormat:@"微信发送：%@", txt];
         } else if ([tp isEqualToString:@"wait"]) {
             NSInteger ms = MAX(100, MIN(5000, [act[@"ms"] integerValue]));
             usleep((useconds_t)(ms * 1000));
