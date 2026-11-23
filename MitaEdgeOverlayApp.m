@@ -311,9 +311,15 @@ static inline CGFloat WaveDepthSecondary(CGFloat s, double ph, BOOL lively) {
 @interface MitaEdgeRootViewController : UIViewController
 @property (nonatomic, strong) MitaEdgeWaveView *waveView;
 @property (nonatomic, strong) CADisplayLink *displayLink;
-@property (nonatomic, strong) NSTimer *pollTimer;
+@property (nonatomic, strong) dispatch_source_t pollSource;
 @property (nonatomic, assign) BOOL screenLocked;
 @property (nonatomic, assign) unsigned int hostedContextId;
+@property (nonatomic, assign) NSTimeInterval lastSeenUpdatedAt;
+@property (nonatomic, assign) NSInteger consecutiveStoppedChecks;
+@property (nonatomic, assign) BOOL statusProbeInFlight;
+@property (nonatomic, assign) NSTimeInterval lastStatusProbeTs;
+@property (nonatomic, assign) NSTimeInterval lastWindowReassertTs;
+@property (nonatomic, copy) void (^reassertWindowBlock)(void);
 - (void)reloadControlStateNow;
 - (void)writeDiagnosticsSnapshot;
 @end
@@ -352,12 +358,20 @@ static inline CGFloat WaveDepthSecondary(CGFloat s, double ph, BOOL lively) {
         [weakSelf updateLockStatus];
     });
 
-    self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
-                                                      target:self
-                                                    selector:@selector(onPollTick)
-                                                    userInfo:nil
-                                                     repeats:YES];
-    [[NSRunLoop mainRunLoop] addTimer:self.pollTimer forMode:NSRunLoopCommonModes];
+    int blankToken = 0;
+    notify_register_dispatch("com.apple.springboard.hasBlankedScreen", &blankToken, dispatch_get_main_queue(), ^(int token) {
+        [weakSelf updateLockStatus];
+    });
+
+    self.pollSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(self.pollSource,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                              (uint64_t)(0.40 * NSEC_PER_SEC),
+                              (uint64_t)(0.05 * NSEC_PER_SEC));
+    dispatch_source_set_event_handler(self.pollSource, ^{
+        [weakSelf onPollTick];
+    });
+    dispatch_resume(self.pollSource);
 
     [self reloadControlStateNow];
 }
@@ -378,15 +392,31 @@ static inline CGFloat WaveDepthSecondary(CGFloat s, double ph, BOOL lively) {
                 self.view.hidden = YES;
             } else {
                 self.view.hidden = NO;
+                if (self.reassertWindowBlock) self.reassertWindowBlock();
                 [self reloadControlStateNow];
+                __weak typeof(self) weakSelf = self;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    if (!weakSelf.screenLocked && weakSelf.reassertWindowBlock) {
+                        weakSelf.reassertWindowBlock();
+                        [weakSelf reloadControlStateNow];
+                    }
+                });
             }
         }
     }
 }
 
 - (void)onPollTick {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    // 每 5 秒自动校验并重申顶层窗口可见性，锁屏解锁或桌面切换后 100% 自动恢复显示
+    if ((now - self.lastWindowReassertTs) >= 5.0) {
+        self.lastWindowReassertTs = now;
+        if (!self.screenLocked && self.reassertWindowBlock) {
+            self.reassertWindowBlock();
+        }
+        [self writeDiagnosticsSnapshot];
+    }
     [self reloadControlStateNow];
-    [self writeDiagnosticsSnapshot];
 }
 
 - (void)writeDiagnosticsSnapshot {
@@ -394,11 +424,13 @@ static inline CGFloat WaveDepthSecondary(CGFloat s, double ph, BOOL lively) {
     NSDictionary *diag = @{
         @"pid": @(getpid()),
         @"uid": @(getuid()),
+        @"version": @"3.1.0",
         @"context_id": @(self.hostedContextId),
         @"active_control": @(self.waveView.activeControl),
         @"active_replying": @(self.waveView.activeReplying),
         @"opacity": @(self.waveView.masterOpacity),
         @"rendered_frames": @(self.waveView.renderedFrames),
+        @"stopped_checks": @(self.consecutiveStoppedChecks),
         @"ts": @((NSInteger)[[NSDate date] timeIntervalSince1970])
     };
     NSData *d = [NSJSONSerialization dataWithJSONObject:diag options:0 error:nil];
@@ -406,6 +438,44 @@ static inline CGFloat WaveDepthSecondary(CGFloat s, double ph, BOOL lively) {
         [d writeToFile:gDiagFilePath atomically:YES];
         chmod([gDiagFilePath UTF8String], 0666);
     }
+}
+
+- (void)probeLocalStatusForGraceCheck {
+    if (self.statusProbeInFlight) return;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if ((now - self.lastStatusProbeTs) < 1.8) return;
+    self.statusProbeInFlight = YES;
+    self.lastStatusProbeTs = now;
+
+    NSURL *u = [NSURL URLWithString:@"http://127.0.0.1:19080/status"];
+    NSURLRequest *req = [NSURLRequest requestWithURL:u cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:1.5];
+    __weak typeof(self) weakSelf = self;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        BOOL explicitStopped = NO;
+        BOOL explicitRunning = NO;
+        if (!e && d.length > 0) {
+            id o = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+            if ([o isKindOfClass:[NSDictionary class]] && o[@"bot_running"] != nil) {
+                if ([o[@"bot_running"] boolValue]) {
+                    explicitRunning = YES;
+                } else {
+                    explicitStopped = YES;
+                }
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            strongSelf.statusProbeInFlight = NO;
+            if (explicitRunning) {
+                strongSelf.consecutiveStoppedChecks = 0;
+                strongSelf.lastSeenUpdatedAt = [[NSDate date] timeIntervalSince1970];
+            } else if (explicitStopped) {
+                strongSelf.consecutiveStoppedChecks += 1;
+            }
+            [strongSelf reloadControlStateNow];
+        });
+    }] resume];
 }
 
 - (void)reloadControlStateNow {
@@ -427,31 +497,27 @@ static inline CGFloat WaveDepthSecondary(CGFloat s, double ph, BOOL lively) {
     BOOL botRunning = [state[@"running"] boolValue];
     NSTimeInterval pulseUntil = [state[@"pulse_until"] doubleValue];
     NSTimeInterval updatedAt = [state[@"updated_at"] doubleValue];
+    BOOL hasPulse = (pulseUntil > now);
 
-    // 若状态文件超过 25 秒未刷新（例如主 App 被手动划掉强退），自动通过本机 19080 核实存活避免残留
-    if (botRunning && updatedAt > 0 && (now - updatedAt) > 25.0) {
-        NSURL *u = [NSURL URLWithString:@"http://127.0.0.1:19080/status"];
-        NSURLRequest *req = [NSURLRequest requestWithURL:u cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:0.45];
-        __block BOOL checkedOk = NO;
-        __block BOOL liveRun = NO;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-            if (!e && d) {
-                id o = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
-                if ([o isKindOfClass:[NSDictionary class]]) {
-                    checkedOk = YES;
-                    liveRun = [o[@"bot_running"] boolValue];
-                }
-            }
-            dispatch_semaphore_signal(sem);
-        }] resume];
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)));
-        if (!checkedOk || !liveRun) {
+    // 一旦检测到新的 updated_at 或脉冲激活，立即清零离线停止计数
+    if (updatedAt > self.lastSeenUpdatedAt + 0.001) {
+        self.lastSeenUpdatedAt = updatedAt;
+        if (botRunning || hasPulse) {
+            self.consecutiveStoppedChecks = 0;
+        }
+    } else if (hasPulse) {
+        self.consecutiveStoppedChecks = 0;
+    }
+
+    // 离线宽限期设为 60s，且需连续 3 次请求 127.0.0.1:19080/status（超时 1.5s）均明确返回 bot_running == false 才淡出
+    if (botRunning && updatedAt > 0 && (now - updatedAt) > 60.0) {
+        if (self.consecutiveStoppedChecks >= 3) {
             botRunning = NO;
+        } else {
+            [self probeLocalStatusForGraceCheck];
         }
     }
 
-    BOOL hasPulse = (pulseUntil > now);
     BOOL shouldShow = edgeEnabled && (botRunning || hasPulse);
     NSString *phaseStr = [state[@"phase"] isKindOfClass:[NSString class]] ? state[@"phase"] : @"idle";
     BOOL isLively = hasPulse
@@ -467,11 +533,22 @@ static inline CGFloat WaveDepthSecondary(CGFloat s, double ph, BOOL lively) {
         startTs = 0;
     }
 
+    BOOL wasShowing = self.waveView.activeControl;
     self.waveView.activeControl = shouldShow;
     self.waveView.activeReplying = isLively;
     self.waveView.startedAtTs = startTs;
 
-    if (shouldShow || self.waveView.masterOpacity > 0.01) {
+    if (shouldShow) {
+        // 0.1 秒内立即自动恢复全屏四边蓝色流动波浪与实时计时
+        if (!wasShowing && self.reassertWindowBlock) {
+            self.reassertWindowBlock();
+        }
+        if (self.waveView.masterOpacity < 0.65) {
+            self.waveView.masterOpacity = 0.65;
+            [self.waveView setNeedsDisplay];
+        }
+        self.displayLink.paused = NO;
+    } else if (self.waveView.masterOpacity > 0.01) {
         self.displayLink.paused = NO;
     }
 }
@@ -480,9 +557,9 @@ static inline CGFloat WaveDepthSecondary(CGFloat s, double ph, BOOL lively) {
     BOOL want = self.waveView.activeControl && !self.screenLocked;
     CGFloat cur = self.waveView.masterOpacity;
     if (want) {
-        cur = MIN(1.0, cur + 0.12);
+        cur = MIN(1.0, cur + 0.36); // < 0.1s 瞬时恢复满亮度蓝色波浪
     } else {
-        cur = MAX(0.0, cur - 0.10);
+        cur = MAX(0.0, cur - 0.12);
     }
     self.waveView.masterOpacity = cur;
 
@@ -564,6 +641,20 @@ static inline CGFloat WaveDepthSecondary(CGFloat s, double ph, BOOL lively) {
     }
 }
 
+- (void)ensureOverlayWindowVisibleAndHosted {
+    if (!self.window) return;
+    CGRect sb = [UIScreen mainScreen].bounds;
+    if (!CGRectEqualToRect(self.window.frame, sb)) {
+        self.window.frame = sb;
+    }
+    self.window.windowLevel = 10000010.0;
+    if (!self.rootVC.screenLocked) {
+        self.window.hidden = NO;
+        self.rootVC.view.hidden = NO;
+    }
+    [self registerSystemOverlayWindow];
+}
+
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     self.rootVC = [[MitaEdgeRootViewController alloc] init];
     self.window = [[MitaEdgeWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
@@ -575,13 +666,17 @@ static inline CGFloat WaveDepthSecondary(CGFloat s, double ph, BOOL lively) {
     self.window.hidden = NO;
     [self.window makeKeyAndVisible];
 
-    [self registerSystemOverlayWindow];
-
     __weak typeof(self) weakSelf = self;
+    self.rootVC.reassertWindowBlock = ^{
+        [weakSelf ensureOverlayWindowVisibleAndHosted];
+    };
+
+    [self ensureOverlayWindowVisibleAndHosted];
+
     static int sbBootToken = 0;
     notify_register_dispatch("SBSpringBoardDidLaunchNotification", &sbBootToken, dispatch_get_main_queue(), ^(int token) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [weakSelf registerSystemOverlayWindow];
+            [weakSelf ensureOverlayWindowVisibleAndHosted];
         });
     });
 

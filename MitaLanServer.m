@@ -68,7 +68,7 @@
         @"platform": @"ios",
         @"app": @"MitaPhoneAgent",
         @"app_title": @"米塔 手机智能体 (巨魔版)",
-        @"version": @"3.0.0",
+        @"version": @"3.1.0",
         @"model": [MitaKeepAliveAndControl deviceModelName],
         @"ios_version": [UIDevice currentDevice].systemVersion ?: @"15.8.2",
         @"width": @((int)nb.size.width),
@@ -182,7 +182,10 @@
         if (hdrEnd.location == NSNotFound) {
             hdrEnd = [buf rangeOfData:sep options:0 range:NSMakeRange(0, buf.length)];
             if (hdrEnd.location != NSNotFound) {
-                NSString *hStr = [[NSString alloc] initWithData:[buf subdataWithRange:NSMakeRange(0, hdrEnd.location)] encoding:NSUTF8StringEncoding] ?: @"";
+                NSData *hdrSlice = [buf subdataWithRange:NSMakeRange(0, hdrEnd.location)];
+                NSString *hStr = [[NSString alloc] initWithData:hdrSlice encoding:NSUTF8StringEncoding]
+                              ?: [[NSString alloc] initWithData:hdrSlice encoding:NSISOLatin1StringEncoding]
+                              ?: @"";
                 for (NSString *ln in [hStr componentsSeparatedByString:@"\r\n"]) {
                     if ([[ln lowercaseString] hasPrefix:@"content-length:"]) {
                         contentLen = [[[ln substringFromIndex:15] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]] integerValue];
@@ -196,7 +199,10 @@
     }
 
     if (hdrEnd.location == NSNotFound) { close(fd); return; }
-    NSString *hStr = [[NSString alloc] initWithData:[buf subdataWithRange:NSMakeRange(0, hdrEnd.location)] encoding:NSUTF8StringEncoding] ?: @"";
+    NSData *hdrSlice = [buf subdataWithRange:NSMakeRange(0, hdrEnd.location)];
+    NSString *hStr = [[NSString alloc] initWithData:hdrSlice encoding:NSUTF8StringEncoding]
+                  ?: [[NSString alloc] initWithData:hdrSlice encoding:NSISOLatin1StringEncoding]
+                  ?: @"";
     NSArray *lines = [hStr componentsSeparatedByString:@"\r\n"];
     NSArray *parts = lines.count ? [lines[0] componentsSeparatedByString:@" "] : @[];
     NSString *method = parts.count > 0 ? [parts[0] uppercaseString] : @"GET";
@@ -204,8 +210,10 @@
     NSString *path = [[fullPath componentsSeparatedByString:@"?"] firstObject] ?: @"/";
     NSString *query = ([fullPath containsString:@"?"]) ? [[fullPath componentsSeparatedByString:@"?"] lastObject] : @"";
 
-    NSData *bodyData = (buf.length > hdrEnd.location + 4)
-        ? [buf subdataWithRange:NSMakeRange(hdrEnd.location + 4, buf.length - hdrEnd.location - 4)]
+    NSUInteger availBody = (buf.length > hdrEnd.location + 4) ? (buf.length - hdrEnd.location - 4) : 0;
+    NSUInteger takeBody = (contentLen > 0 && (NSUInteger)contentLen < availBody) ? (NSUInteger)contentLen : availBody;
+    NSData *bodyData = (takeBody > 0)
+        ? [buf subdataWithRange:NSMakeRange(hdrEnd.location + 4, takeBody)]
         : [NSData data];
 
     if ([method isEqualToString:@"OPTIONS"]) {
@@ -241,8 +249,9 @@
         id inObj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : @{};
         NSDictionary *act = [inObj isKindOfClass:[NSDictionary class]] ? inObj : @{};
         [[MitaFloatingHudManager shared] triggerControlPulseSeconds:6.5 phase:@"controlling"];
-        NSArray *steps = [[MitaKeepAliveAndControl shared] executeActionBatch:@[act]];
-        respObj = @{@"ok": @(YES), @"steps": steps};
+        NSArray *batch = [act[@"actions"] isKindOfClass:[NSArray class]] ? act[@"actions"] : @[act];
+        NSArray *steps = [[MitaKeepAliveAndControl shared] executeActionBatch:batch];
+        respObj = @{@"ok": @(YES), @"steps": steps, @"version": @"3.1.0"};
     } else if ([path isEqualToString:@"/edge_pulse"]) {
         id inObj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : @{};
         NSDictionary *dict = [inObj isKindOfClass:[NSDictionary class]] ? inObj : @{};

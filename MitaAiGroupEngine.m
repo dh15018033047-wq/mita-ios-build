@@ -91,7 +91,7 @@
     s = [pre stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@""];
     s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 
-    NSMutableArray<NSString *> *names = [@[@"豆奶", @"米塔"] mutableCopy];
+    NSMutableArray<NSString *> *names = [@[@"豆奶", @"米塔", @"小鲸鱼", @"鲸鲸"] mutableCopy];
     for (NSString *k in [MitaConfigStore splitCsvList:[MitaConfigStore shared].groupKeywords]) {
         NSString *ck = [k stringByReplacingOccurrencesOfString:@"@" withString:@""];
         if (ck.length > 0 && ![names containsObject:ck]) [names addObject:ck];
@@ -262,7 +262,7 @@
             NSString *kl = [[kw stringByReplacingOccurrencesOfString:@"@" withString:@""] lowercaseString];
             if (kl.length > 0 && [bodyLow containsString:kl]) { hasWake = YES; break; }
         }
-        if ([bodyLow containsString:@"@豆奶"] || [bodyLow containsString:@"@米塔"]) hasWake = YES;
+        if ([bodyLow containsString:@"@豆奶"] || [bodyLow containsString:@"@米塔"] || [bodyLow containsString:@"@小鲸鱼"] || [bodyLow containsString:@"@鲸鲸"]) hasWake = YES;
 
         // 判断是否在专门 @其他群友（有眼力见不乱插嘴）
         NSRegularExpression *atRe = [NSRegularExpression regularExpressionWithPattern:@"[@＠]([^\\u2005\\s,，:：@＠]{1,20})" options:0 error:nil];
@@ -545,7 +545,9 @@
         } else if ((m = [persRe firstMatchInString:raw options:0 range:NSMakeRange(0, raw.length)])) {
             NSString *target = [self cleanMemberArg:[raw substringWithRange:[m rangeAtIndex:1]]];
             for (NSDictionary *p in [store personaPresets]) {
-                if ([p[@"name"] isEqualToString:target] || [p[@"id"] isEqualToString:[target lowercaseString]]) {
+                if ([p[@"name"] isEqualToString:target]
+                    || [p[@"id"] isEqualToString:[target lowercaseString]]
+                    || ([p[@"id"] isEqualToString:@"whale"] && ([target isEqualToString:@"鲸鲸"] || [target containsString:@"鲸鱼"]))) {
                     store.personaId = p[@"id"];
                     store.customPrompt = p[@"prompt"];
                     reply = [NSString stringWithFormat:@"收到，人设已切换为「%@」（%@）啦～", p[@"name"], p[@"badge"]];
@@ -553,7 +555,7 @@
                     break;
                 }
             }
-            if (!reply) reply = @"未找到该预设人设，可选：晚风、豆奶、陆离、姜姜、阿泽、沈言";
+            if (!reply) reply = @"未找到该预设人设，可选：小鲸鱼、豆奶、晚风、陆离、姜姜、阿泽、沈言";
         }
     }
 
@@ -958,9 +960,9 @@
     dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
     self.patrolTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
     dispatch_source_set_timer(self.patrolTimer,
-                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                              (uint64_t)(2.4 * NSEC_PER_SEC),
-                              (uint64_t)(0.3 * NSEC_PER_SEC));
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                              (uint64_t)(1.5 * NSEC_PER_SEC),
+                              (uint64_t)(0.15 * NSEC_PER_SEC));
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(self.patrolTimer, ^{
         [weakSelf patrolLoopTick];
@@ -1437,7 +1439,7 @@
 
         NSString *replyTxt = [genRes[@"reply"] isKindOfClass:[NSString class]] ? genRes[@"reply"] : @"";
         if ([genRes[@"ok"] boolValue] && ![genRes[@"blocked"] boolValue] && replyTxt.length > 0 && self.isAutoReplyRunning) {
-            usleep(1100000); // 1.1s 拟人打字停顿
+            usleep(120000); // 0.12s 极速响应上屏发送
             BOOL sent = [[MitaKeepAliveAndControl shared] vncTypeAndSendWeChatText:replyTxt autoSend:YES];
             if (sent) {
                 [self.guardLock lock];

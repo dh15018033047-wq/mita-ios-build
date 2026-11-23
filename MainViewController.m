@@ -90,6 +90,7 @@
     NSMutableDictionary *d = [[store toDictionaryRedactingKey:YES] mutableCopy];
     NSString *ip = [MitaKeepAliveAndControl deviceLanIPv4];
     d[@"platform"] = @"ios";
+    d[@"version"] = @"3.1.0";
     d[@"device_ip"] = ip;
     d[@"lan_endpoint"] = [NSString stringWithFormat:@"http://%@:%d", ip, [MitaLanServer shared].listenPort];
     d[@"device_model"] = [MitaKeepAliveAndControl deviceModelName];

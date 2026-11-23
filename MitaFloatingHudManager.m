@@ -36,7 +36,8 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
 @property (nonatomic, copy) NSString *curModel;
 @property (nonatomic, assign) NSInteger curRepliedCount;
 @property (nonatomic, copy) NSString *curStatusLine;
-@property (nonatomic, strong) NSTimer *keepSyncTimer;
+@property (nonatomic, strong) dispatch_source_t keepSyncSource;
+- (void)ensureKeepSyncTimerStarted;
 @end
 
 @implementation MitaFloatingHudManager
@@ -60,6 +61,7 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
         _curModel = @"grok-4.7";
         _curRepliedCount = 0;
         _curStatusLine = @"点击「立即启动」开启全局屏幕边缘蓝色波浪控制";
+        [self ensureKeepSyncTimerStarted];
     }
     return self;
 }
@@ -211,31 +213,58 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
     notify_post(MITA_NOTIFY_EDGE_CHANGED);
 }
 
+- (void)ensureKeepSyncTimerStarted {
+    [self.stateLock lock];
+    if (self.keepSyncSource != nil) {
+        [self.stateLock unlock];
+        return;
+    }
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    dispatch_source_set_timer(src,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                              (uint64_t)(3.0 * NSEC_PER_SEC),
+                              (uint64_t)(0.2 * NSEC_PER_SEC));
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(src, ^{
+        [weakSelf onHeartbeatRefresh];
+    });
+    self.keepSyncSource = src;
+    [self.stateLock unlock];
+    dispatch_resume(src);
+}
+
 - (void)attachToHostView:(UIView *)hostView {
-    // 立即预热系统级全屏无感穿透边缘波浪守护进程（不再创建任何画中画小方块视图）
+    [self ensureKeepSyncTimerStarted];
+    // 立即预热系统级全屏无感穿透边缘波浪守护进程（退后台由高优先级 GCD dispatch_source_t 每 3 秒守护自愈）
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         if ([MitaConfigStore shared].floatingHudEnabled) {
             [self ensureOverlayDaemonLaunched];
         }
         [self writeAndNotifyEdgeState];
     });
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (!self.keepSyncTimer) {
-            // 每 8 秒刷新一次心跳时间戳，向守护进程证明主控存活
-            self.keepSyncTimer = [NSTimer scheduledTimerWithTimeInterval:8.0
-                                                                  target:self
-                                                                selector:@selector(onHeartbeatRefresh)
-                                                                userInfo:nil
-                                                                 repeats:YES];
-            [[NSRunLoop mainRunLoop] addTimer:self.keepSyncTimer forMode:NSRunLoopCommonModes];
-        }
-    });
 }
 
 - (void)onHeartbeatRefresh {
+    if (![MitaConfigStore shared].floatingHudEnabled) return;
+    [self.stateLock lock];
+    BOOL running = self.curRunning;
+    NSTimeInterval pulseTs = self.pulseUntilTs;
+    [self.stateLock unlock];
+
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (self.curRunning || self.pulseUntilTs > now) {
+    BOOL shouldKeepWave = (running || pulseTs > now);
+
+    // 每 3.0 秒检查守护进程存活，若意外退出则 1 秒内立即自动拉起并同步最新状态！
+    if (![self isDaemonAlive]) {
+        if ([self ensureOverlayDaemonLaunched]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                           dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                [self writeAndNotifyEdgeState];
+            });
+        }
+    }
+    if (shouldKeepWave) {
         [self writeAndNotifyEdgeState];
     }
 }

@@ -15,6 +15,7 @@ NS_ASSUME_NONNULL_BEGIN
 // 2. 巨魔高权限应用秒开 (LSApplicationWorkspace + URL Scheme 兜底)
 - (BOOL)launchAppByNameOrBundleId:(NSString *)appSpec;
 - (BOOL)openUrlString:(NSString *)urlStr;
+- (NSString *)extractTextFromActionDict:(NSDictionary *)act;
 - (void)copyTextToPasteboard:(NSString *)text;
 
 // 3. 本机回环连接 TrollVNC (127.0.0.1:5901) 实现脱离电脑独立控机与截屏识屏

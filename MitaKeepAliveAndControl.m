@@ -190,10 +190,42 @@
     return opened;
 }
 
+- (NSString *)extractTextFromActionDict:(NSDictionary *)act {
+    if (![act isKindOfClass:[NSDictionary class]]) return @"";
+    id b64Val = act[@"text_b64"];
+    if ([b64Val isKindOfClass:[NSString class]]) {
+        NSString *b64Str = [(NSString *)b64Val stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (b64Str.length > 0) {
+            NSData *decoded = [[NSData alloc] initWithBase64EncodedString:b64Str
+                                                                  options:NSDataBase64DecodingIgnoreUnknownCharacters];
+            if (decoded.length > 0) {
+                NSString *utf8Str = [[NSString alloc] initWithData:decoded encoding:NSUTF8StringEncoding];
+                if (utf8Str != nil) {
+                    return utf8Str;
+                }
+            }
+        }
+    }
+    id rawTxt = act[@"text"];
+    if ([rawTxt isKindOfClass:[NSString class]]) {
+        return (NSString *)rawTxt;
+    }
+    if (rawTxt && rawTxt != [NSNull null]) {
+        return [rawTxt description];
+    }
+    return @"";
+}
+
 - (void)copyTextToPasteboard:(NSString *)text {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [UIPasteboard generalPasteboard].string = text ?: @"";
-    });
+    NSString *cleanText = text ?: @"";
+    dispatch_block_t writeBlk = ^{
+        [UIPasteboard generalPasteboard].string = cleanText;
+    };
+    if ([NSThread isMainThread]) {
+        writeBlk();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), writeBlk);
+    }
 }
 
 #pragma mark - Loopback RFB / TrollVNC Client (127.0.0.1:5901)
@@ -378,98 +410,158 @@ static BOOL sendKey(int fd, uint8_t down, uint32_t keysym) {
 }
 
 - (BOOL)vncSendClipboardText:(NSString *)text {
-    [self copyTextToPasteboard:text];
-    [self.vncLock lock];
-    int w = 0, h = 0;
-    int fd = [self connectLocalRfbAndHandshake:&w height:&h];
-    if (fd < 0) { [self.vncLock unlock]; return NO; }
-    NSData *utf8 = [text dataUsingEncoding:NSUTF8StringEncoding];
-    uint32_t len = (uint32_t)utf8.length;
-    uint8_t hdr[8] = {6, 0, 0, 0, (uint8_t)(len >> 24), (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)(len & 0xFF)};
-    BOOL ok = writeExact(fd, hdr, 8) && (len == 0 || writeExact(fd, utf8.bytes, len));
-    usleep(30000);
-    close(fd);
-    [self.vncLock unlock];
-    return ok;
+    // 严格通过巨魔原生权限在主线程同步写入系统 UIPasteboard，严禁发送 VNC Latin-1 ClientCutText 造成乱码回写！
+    [self copyTextToPasteboard:(text ?: @"")];
+    return YES;
+}
+
+// 检测微信软键盘是否已弹起（键盘弹起时 y≈0.595 存在白色输入条且底部为键盘面板）
+static BOOL MitaDetectKeyboardOpenInImage(CGImageRef cgImg) {
+    if (!cgImg) return NO;
+    const int sw = 120, sh = 220;
+    uint8_t *px = (uint8_t *)calloc(1, sw * sh * 4);
+    if (!px) return NO;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(px, sw, sh, 8, sw * 4, cs, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, sw, sh), cgImg);
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+
+    int iy0 = (int)(sh * 0.575), iy1 = (int)(sh * 0.615);
+    int ix0 = (int)(sw * 0.22),  ix1 = (int)(sw * 0.66);
+    int whiteCnt = 0, totalInput = 0;
+    for (int y = iy0; y <= iy1; y++) {
+        for (int x = ix0; x <= ix1; x++) {
+            int off = (y * sw + x) * 4;
+            int r = px[off], g = px[off + 1], b = px[off + 2];
+            totalInput++;
+            if (r >= 238 && g >= 238 && b >= 238) whiteCnt++;
+        }
+    }
+
+    int ky0 = (int)(sh * 0.70), ky1 = (int)(sh * 0.88);
+    int kx0 = (int)(sw * 0.10), kx1 = (int)(sw * 0.90);
+    int grayBandCnt = 0, totalKb = 0;
+    for (int y = ky0; y <= ky1; y++) {
+        for (int x = kx0; x <= kx1; x++) {
+            int off = (y * sw + x) * 4;
+            int r = px[off], g = px[off + 1], b = px[off + 2];
+            totalKb++;
+            if (r >= 185 && r <= 226 && g >= 188 && g <= 228 && b >= 192 && b <= 234 && abs(r - b) <= 16) {
+                grayBandCnt++;
+            }
+        }
+    }
+    free(px);
+    double whiteRatio = totalInput > 0 ? ((double)whiteCnt / (double)totalInput) : 0.0;
+    double kbGrayRatio = totalKb > 0 ? ((double)grayBandCnt / (double)totalKb) : 0.0;
+    return (whiteRatio >= 0.48 && kbGrayRatio >= 0.22);
+}
+
+// 像素级极速定位 iOS 黑色气泡菜单「粘贴」(y ∈ [0.475, 0.575], x ∈ [0.09, 0.58])，耗时 < 2ms
+static BOOL MitaLocatePasteCalloutInImage(CGImageRef cgImg, double *outNormX, double *outNormY) {
+    if (!cgImg) return NO;
+    const int sw = 207, sh = 368;
+    uint8_t *px = (uint8_t *)calloc(1, sw * sh * 4);
+    if (!px) return NO;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(px, sw, sh, 8, sw * 4, cs, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, sw, sh), cgImg);
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+
+    int y0 = (int)(sh * 0.475), y1 = (int)(sh * 0.575);
+    int x0 = (int)(sw * 0.09),  x1 = (int)(sw * 0.58);
+    double sumX = 0.0, sumY = 0.0;
+    int darkHits = 0, brightTextInDark = 0;
+
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            int off = (y * sw + x) * 4;
+            int r = px[off], g = px[off + 1], b = px[off + 2];
+            if (r <= 58 && g <= 58 && b <= 64) {
+                darkHits++;
+                sumX += x;
+                sumY += y;
+            } else if (r >= 215 && g >= 215 && b >= 215 && x > x0 + 2 && x < x1 - 2) {
+                int leftOff = (y * sw + (x - 3)) * 4;
+                int rightOff = (y * sw + (x + 3)) * 4;
+                if ((px[leftOff] <= 65 && px[leftOff + 1] <= 65) || (px[rightOff] <= 65 && px[rightOff + 1] <= 65)) {
+                    brightTextInDark++;
+                }
+            }
+        }
+    }
+    free(px);
+
+    if (darkHits >= 42 && brightTextInDark >= 4) {
+        if (outNormX) *outNormX = (sumX / (double)darkHits) / (double)sw;
+        if (outNormY) *outNormY = (sumY / (double)darkHits) / (double)sh;
+        return YES;
+    }
+    return NO;
 }
 
 - (BOOL)vncTypeAndSendWeChatText:(NSString *)text autoSend:(BOOL)autoSend {
     NSString *clean = [text ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (clean.length == 0) return NO;
-    // 1. 直接通过巨魔后台剪贴板特权同步写入系统 UIPasteboard
-    if ([NSThread isMainThread]) {
-        [UIPasteboard generalPasteboard].string = clean;
-    } else {
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            [UIPasteboard generalPasteboard].string = clean;
-        });
+
+    // 1. 主线程同步写入系统 UIPasteboard（100% 原生 UTF-8/UTF-16，绝不走 VNC Latin-1，绝不敲 26 键拼音！）
+    [self copyTextToPasteboard:clean];
+
+    // 2. 检查当前软键盘是否已打开，若已打开则直接复用免重开
+    UIImage *preImg = [self captureLocalVncScreenImage];
+    BOOL kbOpen = (preImg && preImg.CGImage) ? MitaDetectKeyboardOpenInImage(preImg.CGImage) : NO;
+
+    if (!kbOpen) {
+        if (![self vncTapNormX:0.447 normY:0.960]) {
+            return NO;
+        }
+        usleep(290000);
     }
 
-    [self.vncLock lock];
-    int w = 0, h = 0;
-    int fd = [self connectLocalRfbAndHandshake:&w height:&h];
-    if (fd < 0) { [self.vncLock unlock]; return NO; }
+    // 3. 在软键盘上方已聚焦输入框左侧光标区 (0.246, 0.595) 呼出 iOS 黑色「粘贴」气泡菜单
+    [self vncTapNormX:0.246 normY:0.595];
+    usleep(140000);
 
-    // 协商 ExtendedClipboard 以双保险同步 UTF-8 剪贴板
-    int32_t encs[2] = { htonl(0), (int32_t)htonl((uint32_t)(-1063131698)) };
-    uint8_t encHdr[4] = { 2, 0, 0, 2 };
-    writeExact(fd, encHdr, 4);
-    writeExact(fd, encs, sizeof(encs));
+    double pasteX = 0.250, pasteY = 0.535;
+    UIImage *menuImg = [self captureLocalVncScreenImage];
+    BOOL foundMenu = (menuImg && menuImg.CGImage) ? MitaLocatePasteCalloutInImage(menuImg.CGImage, &pasteX, &pasteY) : NO;
 
-    NSData *utf8 = [clean dataUsingEncoding:NSUTF8StringEncoding];
-    if (utf8.length > 0) {
-        uint32_t rawLen = htonl((uint32_t)utf8.length + 1);
-        NSMutableData *rawClip = [NSMutableData dataWithCapacity:4 + utf8.length + 1];
-        [rawClip appendBytes:&rawLen length:4];
-        [rawClip appendData:utf8];
-        uint8_t nul = 0;
-        [rawClip appendBytes:&nul length:1];
+    if (!foundMenu) {
+        [self.vncLock lock];
+        int w = 0, h = 0;
+        int fd = [self connectLocalRfbAndHandshake:&w height:&h];
+        if (fd >= 0) {
+            uint16_t lx = (uint16_t)MAX(1, MIN(w - 2, (int)llround(0.246 * w)));
+            uint16_t ly = (uint16_t)MAX(1, MIN(h - 2, (int)llround(0.595 * h)));
+            sendPointer(fd, 0, lx, ly);
+            usleep(6000);
+            sendPointer(fd, 1, lx, ly);
+            usleep(420000);
+            sendPointer(fd, 0, lx, ly);
+            usleep(15000);
+            close(fd);
+        }
+        [self.vncLock unlock];
+        usleep(95000);
 
-        uLongf compCap = compressBound((uLong)rawClip.length);
-        NSMutableData *compBuf = [NSMutableData dataWithLength:compCap];
-        if (compress((Bytef *)compBuf.mutableBytes, &compCap, (const Bytef *)rawClip.bytes, (uLong)rawClip.length) == Z_OK) {
-            uint32_t flags = htonl((1U << 0) | (1U << 24));
-            NSMutableData *extPayload = [NSMutableData dataWithCapacity:4 + compCap];
-            [extPayload appendBytes:&flags length:4];
-            [extPayload appendBytes:compBuf.bytes length:compCap];
-            int32_t negLen = (int32_t)htonl((uint32_t)(-((int32_t)extPayload.length)));
-            uint8_t cutHdr[4] = { 6, 0, 0, 0 };
-            writeExact(fd, cutHdr, 4);
-            writeExact(fd, &negLen, 4);
-            writeExact(fd, extPayload.bytes, extPayload.length);
+        UIImage *menuImg2 = [self captureLocalVncScreenImage];
+        if (menuImg2 && menuImg2.CGImage) {
+            MitaLocatePasteCalloutInImage(menuImg2.CGImage, &pasteX, &pasteY);
         }
     }
 
-    // 2. 轻点微信底部聊天输入框聚焦 (x=0.47, y=0.953)
-    uint16_t ix = (uint16_t)llround(0.47 * w);
-    uint16_t iy = (uint16_t)llround(0.953 * h);
-    sendPointer(fd, 0, ix, iy);
-    usleep(8000);
-    sendPointer(fd, 1, ix, iy);
-    usleep(52000);
-    sendPointer(fd, 0, ix, iy);
-    usleep(320000);
+    // 4. 秒点「粘贴」气泡菜单将剪贴板完整 UTF-8 文本整句上屏
+    BOOL pasted = [self vncTapNormX:pasteX normY:pasteY];
+    usleep(85000);
 
-    // 3. 发送硬件组合键 Command(Super_L 0xFFEB) + v 粘贴正文
-    sendKey(fd, 1, 0xFFEB);
-    usleep(30000);
-    sendKey(fd, 1, 'v');
-    usleep(30000);
-    sendKey(fd, 0, 'v');
-    usleep(30000);
-    sendKey(fd, 0, 0xFFEB);
-    usleep(180000);
-
-    // 4. 发送 Return (0xFF0D) 完成微信消息发送
-    BOOL ok = YES;
+    // 5. 若开启自动发送，立即点击软键盘右下角绿色/蓝色「发送」按钮 (0.884, 0.970)
+    BOOL ok = pasted;
     if (autoSend) {
-        ok = sendKey(fd, 1, 0xFF0D);
-        usleep(35000);
-        ok = ok && sendKey(fd, 0, 0xFF0D);
-        usleep(80000);
+        ok = [self vncTapNormX:0.884 normY:0.970];
+        usleep(45000);
     }
-    close(fd);
-    [self.vncLock unlock];
     return ok;
 }
 
@@ -627,14 +719,15 @@ static void releaseVncFbBytes(void *info, const void *data, size_t size) {
             ok = [self vncHomeKey];
             desc = @"返回主屏幕";
         } else if ([tp isEqualToString:@"input_text"] || [tp isEqualToString:@"copy_text"]) {
-            NSString *txt = act[@"text"] ?: @"";
-            ok = [self vncSendClipboardText:txt];
-            desc = [NSString stringWithFormat:@"写入剪贴板：%@", txt];
+            NSString *txt = [self extractTextFromActionDict:act];
+            [self copyTextToPasteboard:txt];
+            ok = YES;
+            desc = [NSString stringWithFormat:@"写入剪贴板(%lu字)：%@", (unsigned long)txt.length, txt];
         } else if ([tp isEqualToString:@"wechat_send"]) {
-            NSString *txt = act[@"text"] ?: @"";
+            NSString *txt = [self extractTextFromActionDict:act];
             BOOL autoSnd = act[@"auto_send"] ? [act[@"auto_send"] boolValue] : YES;
             ok = [self vncTypeAndSendWeChatText:txt autoSend:autoSnd];
-            desc = [NSString stringWithFormat:@"微信发送：%@", txt];
+            desc = [NSString stringWithFormat:@"微信粘贴发送(%lu字)：%@", (unsigned long)txt.length, txt];
         } else if ([tp isEqualToString:@"wait"]) {
             NSInteger ms = MAX(100, MIN(5000, [act[@"ms"] integerValue]));
             usleep((useconds_t)(ms * 1000));

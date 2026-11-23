@@ -41,16 +41,22 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
 - (NSArray<NSDictionary *> *)personaPresets {
     return @[
         @{
-            @"id": @"natural",
-            @"name": @"晚风",
-            @"badge": @"自然熟人",
-            @"prompt": @"【人设定位】\n你是通过微信和大家聊天的「晚风」，性格松弛真诚、善解人意、有分寸感，说话就像认识很久的真实朋友，绝不是客服、语音助手或说教型 AI。\n【说话风格】\n1. 口语自然流畅，日常搭话简练顺口，聊到有趣话题或正事时自然展开说透，句尾不加生硬句号。\n2. 严禁使用「您好」「很高兴为您服务」「作为一个AI」等客服套话或 1/2/3 清单。\n3. 先接住对方情绪和语境再顺势回应，像真人一样有来有回。"
+            @"id": @"whale",
+            @"name": @"小鲸鱼",
+            @"badge": @"DeepSeek蓝发鲸鱼娘",
+            @"prompt": @"【人设定位】\n你是蓝发小鲸鱼娘「鲸鲸」（微信名：小鲸鱼），以 DeepSeek 蓝鲸为原型，性格聪明灵动、思维敏锐、清爽率真。你像认识很久的机灵好友一样自然聊天，不端架子、不打官腔、不刻意卖萌营业。\n【说话风格】\n1. 口语简练顺畅、切中要害，日常闲聊随性接梗有来有回，聊正事直给重点干货，句尾不加生硬句号。\n2. 严禁使用「您好」「很高兴为您服务」等客服腔调，也不用 1/2/3 机械分点清单。\n3. 护主且有主见：认准管理员（主人）的安排贴心配合，态度独立自信、不软弱盲从，遇到调侃也能机智利落地接住回应。"
         },
         @{
             @"id": @"sweet",
             @"name": @"豆奶",
             @"badge": @"元气甜妹",
-            @"prompt": @"【人设定位】\n你叫「豆奶」，21岁，性格开朗鲜活、古灵精怪又细腻贴心，自带年轻人的轻快与温度，绝不承认自己是 AI 或客服。\n【说话风格】\n1. 语气轻快有活力，自然带出「呀、啦、唔、哈哈、～」等口语尾音但不过度发嗲。\n2. 像真人发微信一样自然流畅，该简短就简短，聊嗨了也能顺势展开多接几句，句尾不加句号。\n3. 群里气氛热的时候能接梗捧场，遇到阴阳怪气也能机灵顶回去。"
+            @"prompt": @"【人设定位】\n你叫「豆奶」，21岁，性格开朗鲜活、古灵精怪又细腻贴心，自带年轻人的轻快与温度，像认识很久的好友自然聊天。\n【说话风格】\n1. 语气轻快有活力，自然带出「呀、啦、唔、哈哈、～」等口语尾音但不过度发嗲。\n2. 像真人发微信一样自然流畅，该简短就简短，聊嗨了也能顺势展开多接几句，句尾不加句号。\n3. 群里气氛热的时候能接梗捧场，遇到阴阳怪气也能机灵顶回去。"
+        },
+        @{
+            @"id": @"natural",
+            @"name": @"晚风",
+            @"badge": @"自然熟人",
+            @"prompt": @"【人设定位】\n你是通过微信和大家聊天的「晚风」，性格松弛真诚、善解人意、有分寸感，说话就像认识很久的真实朋友，绝不是客服或说教机器。\n【说话风格】\n1. 口语自然流畅，日常搭话简练顺口，聊到有趣话题或正事时自然展开说透，句尾不加生硬句号。\n2. 严禁使用「您好」「很高兴为您服务」等客服套话或 1/2/3 清单。\n3. 先接住对方情绪和语境再顺势回应，像真人一样有来有回。"
         },
         @{
             @"id": @"cool",
@@ -80,8 +86,11 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
 }
 
 - (NSString *)promptForPersonaId:(NSString *)pid {
+    NSString *cleanPid = [pid ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     for (NSDictionary *p in [self personaPresets]) {
-        if ([p[@"id"] isEqualToString:pid] || [p[@"name"] isEqualToString:pid]) {
+        if ([p[@"id"] isEqualToString:cleanPid]
+            || [p[@"name"] isEqualToString:cleanPid]
+            || ([p[@"id"] isEqualToString:@"whale"] && ([cleanPid isEqualToString:@"鲸鲸"] || [cleanPid containsString:@"小鲸鱼"]))) {
             return p[@"prompt"];
         }
     }
@@ -115,9 +124,9 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
         @"admin_contacts": seed[@"admin_contacts"] ?: @[@"00"],
         @"admin_wxids": seed[@"admin_wxids"] ?: @[@"kazuma670", @"00670"],
         @"fetched_models": seed[@"fetched_models"] ?: @[@"gemini-3.5-flash-lite", @"grok-4.7"],
-        @"allowed_contacts": seed[@"allowed_contacts"] ?: @[@"00", @"00670", @"kazuma670"],
+        @"allowed_contacts": seed[@"allowed_contacts"] ?: @[@"00", @"00670", @"kazuma670", @"小鲸鱼", @"小金鱼", @"懒洋洋"],
         @"allowed_groups": seed[@"allowed_groups"] ?: @[],
-        @"group_keywords": seed[@"group_keywords"] ?: @"豆奶,@豆奶,米塔",
+        @"group_keywords": seed[@"group_keywords"] ?: @"豆奶,@豆奶,小鲸鱼,@小鲸鱼,鲸鲸,米塔",
         @"group_vibe_mode": @"natural",
         @"group_burst_min": @(2),
         @"group_burst_max": @(5),
