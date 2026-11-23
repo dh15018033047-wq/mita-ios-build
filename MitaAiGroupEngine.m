@@ -944,6 +944,7 @@
         [self setAutoReplyRunning:YES launchWeChat:NO triggerSource:@"bootstrap"];
     } else {
         [[MitaFloatingHudManager shared] updateWithRunning:NO
+                                               startedAtTs:0
                                                      phase:@"idle"
                                                      model:store.apiModel
                                               repliedCount:self.totalRepliedCount
@@ -978,6 +979,7 @@
     if (line.length > 0) self.monitorStatusLine = line;
     if (repCnt >= 0) self.totalRepliedCount = repCnt;
     BOOL running = self.isAutoReplyRunning;
+    NSTimeInterval stTs = self.startedAtTs;
     NSString *pCopy = self.monitorPhase ?: @"idle";
     NSString *sCopy = self.monitorStatusLine ?: @"";
     NSInteger cCopy = self.totalRepliedCount;
@@ -985,6 +987,7 @@
 
     NSString *model = [MitaConfigStore shared].apiModel ?: @"grok-4.7";
     [[MitaFloatingHudManager shared] updateWithRunning:running
+                                           startedAtTs:stTs
                                                  phase:pCopy
                                                  model:model
                                           repliedCount:cCopy
@@ -997,6 +1000,7 @@
     NSTimeInterval upSec = (running && self.startedAtTs > 0) ? MAX(0, [[NSDate date] timeIntervalSince1970] - self.startedAtTs) : 0;
     NSDictionary *snap = @{
         @"running": @(running),
+        @"started_at": @((NSInteger)llround(self.startedAtTs)),
         @"uptime_sec": @((NSInteger)llround(upSec)),
         @"phase": self.monitorPhase ?: @"idle",
         @"engine_mode": self.monitorEngineMode ?: (running ? @"正在连接引擎" : @"待命未启动"),
@@ -1118,6 +1122,11 @@
     }
 
     NSDictionary *mon = [respDict[@"monitor"] isKindOfClass:[NSDictionary class]] ? respDict[@"monitor"] : @{};
+    if ([respDict[@"started_at"] integerValue] > 0) {
+        [self.guardLock lock];
+        self.startedAtTs = [respDict[@"started_at"] doubleValue];
+        [self.guardLock unlock];
+    }
     NSString *phase = [mon[@"phase"] isKindOfClass:[NSString class]] ? mon[@"phase"] : @"patrolling";
     NSString *lastMsg = [mon[@"last_message"] isKindOfClass:[NSString class]] ? mon[@"last_message"] : @"正在监听微信白名单消息…";
     NSString *lastContact = [mon[@"last_contact"] isKindOfClass:[NSString class]] ? mon[@"last_contact"] : @"";
@@ -1374,6 +1383,11 @@
         }
 
         if (msgLines.count == 0 || ![msgLines.lastObject[@"role"] isEqualToString:@"peer"]) {
+            if (msgLines.count > 0 && [msgLines.lastObject[@"role"] isEqualToString:@"self"]) {
+                [self.guardLock lock];
+                [self.lastRepliedSignatures removeObjectForKey:contactTitle];
+                [self.guardLock unlock];
+            }
             [self updateRuntimePhase:@"watching"
                           engineMode:@"巨魔本机独立引擎"
                          lastContact:contactTitle

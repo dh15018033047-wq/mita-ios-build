@@ -12,6 +12,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (void)attachToHostView:(UIView *)hostView;
 - (void)updateWithRunning:(BOOL)running
+              startedAtTs:(NSTimeInterval)startedAtTs
                     phase:(NSString *)phase
                     model:(NSString *)model
              repliedCount:(NSInteger)repliedCount
