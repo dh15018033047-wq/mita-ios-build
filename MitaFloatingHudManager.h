@@ -18,9 +18,11 @@ NS_ASSUME_NONNULL_BEGIN
              repliedCount:(NSInteger)repliedCount
                statusLine:(NSString *)statusLine;
 
+- (void)triggerControlPulseSeconds:(NSTimeInterval)seconds phase:(NSString *)phase;
 - (void)syncPlaybackState;
 - (BOOL)startFloatingWindow;
 - (void)stopFloatingWindow;
+- (NSDictionary *)overlayDiagnostics;
 
 @end
 

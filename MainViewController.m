@@ -100,6 +100,7 @@
     d[@"bot_running"] = @([MitaAiGroupEngine shared].isAutoReplyRunning);
     d[@"floating_hud_supported"] = @([MitaFloatingHudManager shared].isSupported);
     d[@"floating_hud_active"] = @([MitaFloatingHudManager shared].isActive);
+    d[@"edge_overlay"] = [[MitaFloatingHudManager shared] overlayDiagnostics];
     d[@"runtime_monitor"] = [[MitaAiGroupEngine shared] runtimeStatusSnapshot];
     NSData *j = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
     return j ? [[NSString alloc] initWithData:j encoding:NSUTF8StringEncoding] : @"{}";

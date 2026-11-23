@@ -1,4 +1,5 @@
 #import "MitaKeepAliveAndControl.h"
+#import "MitaFloatingHudManager.h"
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -592,7 +593,8 @@ static void releaseVncFbBytes(void *info, const void *data, size_t size) {
 
 - (NSArray<NSDictionary *> *)executeActionBatch:(NSArray<NSDictionary *> *)actions {
     NSMutableArray *results = [NSMutableArray array];
-    if (![actions isKindOfClass:[NSArray class]]) return results;
+    if (![actions isKindOfClass:[NSArray class]] || actions.count == 0) return results;
+    [[MitaFloatingHudManager shared] triggerControlPulseSeconds:6.5 phase:@"controlling"];
     for (NSDictionary *act in actions) {
         if (![act isKindOfClass:[NSDictionary class]]) continue;
         NSString *tp = [[act[@"type"] ?: act[@"action"] ?: @"" description] lowercaseString];

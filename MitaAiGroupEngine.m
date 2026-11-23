@@ -770,6 +770,7 @@
         }
         NSArray *steps = @[];
         if (actions.count > 0) {
+            [[MitaFloatingHudManager shared] triggerControlPulseSeconds:8.0 phase:@"controlling"];
             steps = [[MitaKeepAliveAndControl shared] executeActionBatch:actions];
         }
         [[MitaConfigStore shared] addEventLogKind:@"agent" contact:@"苹果对话控机" incoming:userText detail:reply costMs:costMs];

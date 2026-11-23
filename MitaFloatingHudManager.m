@@ -1,25 +1,42 @@
 #import "MitaFloatingHudManager.h"
 #import "MitaConfigStore.h"
-#import "MitaAiGroupEngine.h"
 #import "MitaKeepAliveAndControl.h"
-#import <AVKit/AVKit.h>
-#import <AVFoundation/AVFoundation.h>
-#import <CoreMedia/CoreMedia.h>
-#import <CoreVideo/CoreVideo.h>
+#import <spawn.h>
+#import <notify.h>
+#import <signal.h>
+#import <errno.h>
+#import <dlfcn.h>
+#import <sys/wait.h>
+#import <sys/stat.h>
 
-@interface MitaFloatingHudManager () <AVPictureInPictureControllerDelegate, AVPictureInPictureSampleBufferPlaybackDelegate>
-@property (nonatomic, strong) UIView *anchorView;
-@property (nonatomic, strong) AVSampleBufferDisplayLayer *sampleLayer;
-@property (nonatomic, strong) AVPictureInPictureController *pipController;
-@property (nonatomic, strong) NSTimer *renderTimer;
-@property (nonatomic, assign) double flowPhase;
+extern char **environ;
+
+#define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 1
+typedef int (*MitaSetPersonaFn)(const posix_spawnattr_t * __restrict, uid_t, uint32_t);
+typedef int (*MitaSetPersonaUidFn)(const posix_spawnattr_t * __restrict, uid_t);
+
+static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
+    MitaSetPersonaFn fnPersona = (MitaSetPersonaFn)dlsym(RTLD_DEFAULT, "posix_spawnattr_set_persona_np");
+    MitaSetPersonaUidFn fnUid  = (MitaSetPersonaUidFn)dlsym(RTLD_DEFAULT, "posix_spawnattr_set_persona_uid_np");
+    MitaSetPersonaUidFn fnGid  = (MitaSetPersonaUidFn)dlsym(RTLD_DEFAULT, "posix_spawnattr_set_persona_gid_np");
+    if (fnPersona) fnPersona(attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+    if (fnUid) fnUid(attr, 0);
+    if (fnGid) fnGid(attr, 0);
+}
+
+#define MITA_NOTIFY_EDGE_CHANGED "com.mita.phoneagent.edge.changed"
+#define MITA_NOTIFY_EDGE_EXIT    "com.mita.phoneagent.edge.exit"
+
+@interface MitaFloatingHudManager ()
+@property (nonatomic, strong) NSLock *stateLock;
 @property (nonatomic, assign) BOOL curRunning;
 @property (nonatomic, assign) NSTimeInterval curStartedAtTs;
+@property (nonatomic, assign) NSTimeInterval pulseUntilTs;
 @property (nonatomic, copy) NSString *curPhase;
 @property (nonatomic, copy) NSString *curModel;
 @property (nonatomic, assign) NSInteger curRepliedCount;
 @property (nonatomic, copy) NSString *curStatusLine;
-@property (nonatomic, strong) NSLock *stateLock;
+@property (nonatomic, strong) NSTimer *keepSyncTimer;
 @end
 
 @implementation MitaFloatingHudManager
@@ -36,87 +53,191 @@
 - (instancetype)init {
     if (self = [super init]) {
         _stateLock = [[NSLock alloc] init];
-        _flowPhase = 0.0;
         _curRunning = NO;
         _curStartedAtTs = 0.0;
+        _pulseUntilTs = 0.0;
         _curPhase = @"idle";
         _curModel = @"grok-4.7";
         _curRepliedCount = 0;
-        _curStatusLine = @"点击 APP 内「立即启动」开启微信自动回复";
+        _curStatusLine = @"点击「立即启动」开启全局屏幕边缘蓝色波浪控制";
     }
     return self;
 }
 
+- (NSString *)sharedIpcDirectory {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *doc = paths.firstObject ?: NSTemporaryDirectory();
+    [[NSFileManager defaultManager] createDirectoryAtPath:doc withIntermediateDirectories:YES attributes:nil error:nil];
+    chmod([doc UTF8String], 0777);
+    return doc;
+}
+
+- (NSString *)stateFilePath {
+    return [[self sharedIpcDirectory] stringByAppendingPathComponent:@"mita_edge_state.json"];
+}
+
+- (NSString *)pidFilePath {
+    return [[self sharedIpcDirectory] stringByAppendingPathComponent:@"mita_edge_overlay.pid"];
+}
+
+- (NSString *)diagFilePath {
+    return [[self sharedIpcDirectory] stringByAppendingPathComponent:@"mita_edge_diag.json"];
+}
+
+- (NSString *)helperBinaryPath {
+    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+    return [bundlePath stringByAppendingPathComponent:@"MitaEdgeOverlay"];
+}
+
 - (BOOL)isSupported {
-    return [AVPictureInPictureController isPictureInPictureSupported];
+    return [[NSFileManager defaultManager] isExecutableFileAtPath:[self helperBinaryPath]] || YES;
+}
+
+- (BOOL)isDaemonAlive {
+    NSString *pidStr = [NSString stringWithContentsOfFile:[self pidFilePath] encoding:NSUTF8StringEncoding error:nil];
+    if (pidStr.length == 0) return NO;
+    pid_t pid = (pid_t)[pidStr intValue];
+    if (pid <= 1) return NO;
+    // 主进程可能是 mobile(501)，守护进程是 root(0)：kill(pid, 0) 返回 -1 且 errno == EPERM 代表进程 100% 存活！
+    int rc = kill(pid, 0);
+    if (rc == 0 || errno == EPERM) {
+        return YES;
+    }
+    return NO;
 }
 
 - (BOOL)isActive {
-    return self.pipController != nil && self.pipController.isPictureInPictureActive;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    return [MitaConfigStore shared].floatingHudEnabled && (self.curRunning || self.pulseUntilTs > now) && [self isDaemonAlive];
+}
+
+- (BOOL)ensureOverlayDaemonLaunched {
+    if (![MitaConfigStore shared].floatingHudEnabled) return NO;
+    if ([self isDaemonAlive]) return YES;
+
+    NSString *binPath = [self helperBinaryPath];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:binPath]) {
+        return NO;
+    }
+
+    NSString *ipcDir = [self sharedIpcDirectory];
+    const char *exe = [binPath UTF8String];
+    const char *dirArg = [ipcDir UTF8String];
+    const char *args[] = { exe, "-hud", dirArg, NULL };
+
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    MitaApplyRootPersonaAttr(&attr);
+    posix_spawnattr_setpgroup(&attr, 0);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+
+    pid_t childPid = 0;
+    int rc = posix_spawn(&childPid, exe, NULL, &attr, (char * const *)args, environ);
+    posix_spawnattr_destroy(&attr);
+
+    if (rc != 0) {
+        // 兜底：若当前环境未授予 persona-mgmt，尝试直接普通 spawn
+        posix_spawnattr_t fbAttr;
+        posix_spawnattr_init(&fbAttr);
+        posix_spawnattr_setpgroup(&fbAttr, 0);
+        posix_spawnattr_setflags(&fbAttr, POSIX_SPAWN_SETPGROUP);
+        rc = posix_spawn(&childPid, exe, NULL, &fbAttr, (char * const *)args, environ);
+        posix_spawnattr_destroy(&fbAttr);
+    }
+
+    if (rc == 0 && childPid > 0) {
+        int unused = 0;
+        waitpid(childPid, &unused, WNOHANG);
+        return YES;
+    }
+    return NO;
+}
+
+- (void)terminateOverlayDaemon {
+    notify_post(MITA_NOTIFY_EDGE_EXIT);
+    NSString *binPath = [self helperBinaryPath];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:binPath]) return;
+
+    NSString *ipcDir = [self sharedIpcDirectory];
+    const char *exe = [binPath UTF8String];
+    const char *dirArg = [ipcDir UTF8String];
+    const char *args[] = { exe, "-exit", dirArg, NULL };
+
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    MitaApplyRootPersonaAttr(&attr);
+    pid_t pid = 0;
+    if (posix_spawn(&pid, exe, NULL, &attr, (char * const *)args, environ) == 0 && pid > 0) {
+        int st = 0;
+        waitpid(pid, &st, WNOHANG);
+    }
+    posix_spawnattr_destroy(&attr);
+}
+
+- (void)writeAndNotifyEdgeState {
+    [self.stateLock lock];
+    BOOL running = self.curRunning;
+    NSTimeInterval startTs = self.curStartedAtTs;
+    NSTimeInterval pulseTs = self.pulseUntilTs;
+    NSString *phase = self.curPhase ?: @"idle";
+    NSString *model = self.curModel ?: @"grok-4.7";
+    NSInteger repCnt = self.curRepliedCount;
+    NSString *line = self.curStatusLine ?: @"";
+    [self.stateLock unlock];
+
+    BOOL edgeEn = [MitaConfigStore shared].floatingHudEnabled;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (edgeEn && (running || pulseTs > now)) {
+        [self ensureOverlayDaemonLaunched];
+    }
+
+    NSDictionary *payload = @{
+        @"edge_enabled": @(edgeEn),
+        @"running": @(running),
+        @"started_at": @(startTs),
+        @"pulse_until": @(pulseTs),
+        @"phase": phase,
+        @"model": model,
+        @"replied_count": @(repCnt),
+        @"status_line": line,
+        @"updated_at": @(now)
+    };
+    NSData *json = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+    if (json) {
+        NSString *fp = [self stateFilePath];
+        [json writeToFile:fp atomically:YES];
+        chmod([fp UTF8String], 0666);
+    }
+    notify_post(MITA_NOTIFY_EDGE_CHANGED);
 }
 
 - (void)attachToHostView:(UIView *)hostView {
-    if (!hostView || self.pipController != nil) return;
-    if (![AVPictureInPictureController isPictureInPictureSupported]) return;
-
-    [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
-
-    UIView *anchor = [[UIView alloc] initWithFrame:CGRectMake(12.0, 56.0, 260.0, 88.0)];
-    anchor.userInteractionEnabled = NO;
-    anchor.backgroundColor = [UIColor clearColor];
-    [hostView insertSubview:anchor atIndex:0];
-    self.anchorView = anchor;
-
-    AVSampleBufferDisplayLayer *layer = [[AVSampleBufferDisplayLayer alloc] init];
-    layer.frame = anchor.bounds;
-    layer.videoGravity = AVLayerVideoGravityResizeAspect;
-    layer.opaque = YES;
-    [anchor.layer addSublayer:layer];
-    self.sampleLayer = layer;
-
-    [self enqueueHudSampleFrame];
-
-    if (@available(iOS 15.0, *)) {
-        AVPictureInPictureControllerContentSource *src =
-            [[AVPictureInPictureControllerContentSource alloc] initWithSampleBufferDisplayLayer:layer
-                                                                               playbackDelegate:self];
-        AVPictureInPictureController *pip = [[AVPictureInPictureController alloc] initWithContentSource:src];
-        pip.delegate = self;
-        pip.canStartPictureInPictureAutomaticallyFromInline = ([MitaConfigStore shared].floatingHudEnabled && self.curRunning);
-        if ([pip respondsToSelector:@selector(setRequiresLinearPlayback:)]) {
-            pip.requiresLinearPlayback = YES;
+    // 立即预热系统级全屏无感穿透边缘波浪守护进程（不再创建任何画中画小方块视图）
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        if ([MitaConfigStore shared].floatingHudEnabled) {
+            [self ensureOverlayDaemonLaunched];
         }
-        self.pipController = pip;
-    }
+        [self writeAndNotifyEdgeState];
+    });
 
-    if (!self.renderTimer) {
-        // 10fps 丝滑驱动四周控制流光边缘与实时秒表跳动
-        self.renderTimer = [NSTimer scheduledTimerWithTimeInterval:0.10
-                                                            target:self
-                                                          selector:@selector(onRenderTick)
-                                                          userInfo:nil
-                                                           repeats:YES];
-        [[NSRunLoop mainRunLoop] addTimer:self.renderTimer forMode:NSRunLoopCommonModes];
-    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.keepSyncTimer) {
+            // 每 8 秒刷新一次心跳时间戳，向守护进程证明主控存活
+            self.keepSyncTimer = [NSTimer scheduledTimerWithTimeInterval:8.0
+                                                                  target:self
+                                                                selector:@selector(onHeartbeatRefresh)
+                                                                userInfo:nil
+                                                                 repeats:YES];
+            [[NSRunLoop mainRunLoop] addTimer:self.keepSyncTimer forMode:NSRunLoopCommonModes];
+        }
+    });
 }
 
-- (void)onRenderTick {
-    [self.stateLock lock];
-    BOOL running = self.curRunning;
-    BOOL thinking = ([self.curPhase isEqualToString:@"replying"] || [self.curPhase isEqualToString:@"analyzing"]);
-    if (running) {
-        self.flowPhase += (thinking ? 0.048 : 0.024);
-        if (self.flowPhase >= 1.0) self.flowPhase -= 1.0;
+- (void)onHeartbeatRefresh {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (self.curRunning || self.pulseUntilTs > now) {
+        [self writeAndNotifyEdgeState];
     }
-    [self.stateLock unlock];
-
-    // 运行中每 0.1s 刷新流光边缘动画；未运行时每 1.0s 低功耗保活刷新
-    static int idleSkip = 0;
-    if (!running) {
-        idleSkip = (idleSkip + 1) % 10;
-        if (idleSkip != 0) return;
-    }
-    [self enqueueHudSampleFrame];
 }
 
 - (void)updateWithRunning:(BOOL)running
@@ -126,7 +247,6 @@
              repliedCount:(NSInteger)repliedCount
                statusLine:(NSString *)statusLine {
     [self.stateLock lock];
-    BOOL changedRun = (_curRunning != running);
     _curRunning = running;
     if (running) {
         if (startedAtTs > 0) _curStartedAtTs = startedAtTs;
@@ -140,293 +260,62 @@
     if (statusLine.length > 0) _curStatusLine = [statusLine copy];
     [self.stateLock unlock];
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (self.pipController) {
-            self.pipController.canStartPictureInPictureAutomaticallyFromInline =
-                ([MitaConfigStore shared].floatingHudEnabled && running);
-            if (changedRun) {
-                [self.pipController invalidatePlaybackState];
-            }
-        }
-        [self enqueueHudSampleFrame];
-    });
+    [self writeAndNotifyEdgeState];
+}
+
+- (void)triggerControlPulseSeconds:(NSTimeInterval)seconds phase:(NSString *)phase {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSTimeInterval dur = MAX(2.0, MIN(30.0, seconds));
+    [self.stateLock lock];
+    if (now + dur > _pulseUntilTs) {
+        _pulseUntilTs = now + dur;
+    }
+    if (!_curRunning && _curStartedAtTs <= 0) {
+        _curStartedAtTs = now;
+    }
+    if (phase.length > 0) {
+        _curPhase = [phase copy];
+    }
+    [self.stateLock unlock];
+
+    [self writeAndNotifyEdgeState];
 }
 
 - (void)syncPlaybackState {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (self.pipController) {
-            self.pipController.canStartPictureInPictureAutomaticallyFromInline =
-                ([MitaConfigStore shared].floatingHudEnabled && self.curRunning);
-            [self.pipController invalidatePlaybackState];
-        }
-        [self enqueueHudSampleFrame];
-    });
+    [self writeAndNotifyEdgeState];
 }
 
 - (BOOL)startFloatingWindow {
-    if (!self.pipController) return NO;
+    [MitaConfigStore shared].floatingHudEnabled = YES;
     [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
-    [self enqueueHudSampleFrame];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.pipController.canStartPictureInPictureAutomaticallyFromInline = YES;
-        if (!self.pipController.isPictureInPictureActive) {
-            [self.pipController startPictureInPicture];
-        }
-    });
-    return YES;
+    BOOL ok = [self ensureOverlayDaemonLaunched];
+    // 点亮一次 5 秒蓝色波浪预览脉冲（若已在控制运行中则常驻流淌）
+    [self triggerControlPulseSeconds:5.0 phase:(self.curRunning ? self.curPhase : @"controlling")];
+    return ok;
 }
 
 - (void)stopFloatingWindow {
-    if (!self.pipController) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.pipController.canStartPictureInPictureAutomaticallyFromInline = NO;
-        if (self.pipController.isPictureInPictureActive) {
-            [self.pipController stopPictureInPicture];
-        }
-    });
-}
-
-static CGPoint pointOnRectPerimeter(CGRect r, double t) {
-    while (t < 0.0) t += 1.0;
-    while (t >= 1.0) t -= 1.0;
-    double w = r.size.width;
-    double h = r.size.height;
-    double perim = 2.0 * (w + h);
-    double d = t * perim;
-    if (d <= w) return CGPointMake(r.origin.x + d, r.origin.y);
-    d -= w;
-    if (d <= h) return CGPointMake(r.origin.x + w, r.origin.y + d);
-    d -= h;
-    if (d <= w) return CGPointMake(r.origin.x + w - d, r.origin.y + h);
-    d -= w;
-    return CGPointMake(r.origin.x, r.origin.y + h - d);
-}
-
-static NSString *formatDurationText(NSInteger sec) {
-    if (sec < 0) sec = 0;
-    NSInteger h = sec / 3600;
-    NSInteger m = (sec % 3600) / 60;
-    NSInteger s = sec % 60;
-    if (h > 0) {
-        return [NSString stringWithFormat:@"%02ld:%02ld:%02ld", (long)h, (long)m, (long)s];
-    }
-    return [NSString stringWithFormat:@"%02ld:%02ld", (long)m, (long)s];
-}
-
-#pragma mark - High-DPI Animated Edge & Timer Renderer (520x176)
-
-- (void)enqueueHudSampleFrame {
-    if (!self.sampleLayer) return;
-    if (self.sampleLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
-        [self.sampleLayer flush];
-    }
-
     [self.stateLock lock];
-    BOOL running = self.curRunning;
-    NSTimeInterval startTs = self.curStartedAtTs;
-    NSString *phase = self.curPhase ?: @"idle";
-    NSString *model = self.curModel ?: @"grok-4.7";
-    NSInteger repliedCnt = self.curRepliedCount;
-    NSString *line = self.curStatusLine ?: @"等待启动";
-    double flow = self.flowPhase;
+    _pulseUntilTs = 0.0;
     [self.stateLock unlock];
-
-    NSInteger elapsedSec = (running && startTs > 0) ? MAX(0, (NSInteger)llround([[NSDate date] timeIntervalSince1970] - startTs)) : 0;
-    NSString *timerStr = formatDurationText(elapsedSec);
-
-    const int width = 520;
-    const int height = 176;
-
-    NSDictionary *attrs = @{
-        (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
-        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
-        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
-    };
-    CVPixelBufferRef pxBuf = NULL;
-    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)attrs, &pxBuf);
-    if (status != kCVReturnSuccess || !pxBuf) return;
-
-    CVPixelBufferLockBaseAddress(pxBuf, 0);
-    void *baseAddr = CVPixelBufferGetBaseAddress(pxBuf);
-    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pxBuf);
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(
-        baseAddr, width, height, 8, bytesPerRow, cs,
-        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst
-    );
-
-    if (ctx) {
-        CGContextTranslateCTM(ctx, 0, height);
-        CGContextScaleCTM(ctx, 1.0, -1.0);
-        UIGraphicsPushContext(ctx);
-
-        UIColor *bgCol = running
-            ? [UIColor colorWithRed:0.05 green:0.08 blue:0.13 alpha:1.0]
-            : [UIColor colorWithRed:0.11 green:0.13 blue:0.17 alpha:1.0];
-        [bgCol setFill];
-        UIRectFill(CGRectMake(0, 0, width, height));
-
-        BOOL isThinking = ([phase isEqualToString:@"replying"] || [phase isEqualToString:@"analyzing"] || [phase isEqualToString:@"entering"]);
-        UIColor *accentCol = !running
-            ? [UIColor colorWithRed:0.56 green:0.63 blue:0.72 alpha:1.0]
-            : (isThinking
-                ? [UIColor colorWithRed:0.22 green:0.74 blue:0.98 alpha:1.0]
-                : [UIColor colorWithRed:0.04 green:0.82 blue:0.46 alpha:1.0]);
-
-        CGRect edgeRect = CGRectMake(3.5, 3.5, width - 7.0, height - 7.0);
-        if (running) {
-            // 1. 柔和发光边缘底轨
-            UIBezierPath *baseTrack = [UIBezierPath bezierPathWithRoundedRect:edgeRect cornerRadius:18.0];
-            baseTrack.lineWidth = 4.5;
-            [[accentCol colorWithAlphaComponent:0.24] setStroke];
-            [baseTrack stroke];
-
-            // 2. 四周旋转追光控制动画（28 段渐变彗星灯带顺时针游走整圈边缘）
-            const int segs = 28;
-            const double tailSpan = 0.42;
-            for (int i = 0; i < segs; i++) {
-                double frac0 = (double)i / (double)segs;
-                double frac1 = (double)(i + 1) / (double)segs;
-                double t0 = flow - tailSpan * (1.0 - frac0);
-                double t1 = flow - tailSpan * (1.0 - frac1);
-                CGPoint p0 = pointOnRectPerimeter(edgeRect, t0);
-                CGPoint p1 = pointOnRectPerimeter(edgeRect, t1);
-
-                UIBezierPath *segPath = [UIBezierPath bezierPath];
-                [segPath moveToPoint:p0];
-                [segPath addLineToPoint:p1];
-                segPath.lineWidth = 5.5 + 2.5 * frac1;
-                segPath.lineCapStyle = kCGLineCapRound;
-
-                UIColor *segCol = isThinking
-                    ? [UIColor colorWithRed:(0.15 + 0.30 * frac1) green:(0.62 + 0.28 * frac1) blue:0.99 alpha:(0.12 + 0.88 * frac1)]
-                    : [UIColor colorWithRed:(0.03 + 0.15 * frac1) green:(0.72 + 0.25 * frac1) blue:(0.42 + 0.42 * frac1) alpha:(0.12 + 0.88 * frac1)];
-                [segCol setStroke];
-                [segPath stroke];
-            }
-
-            // 追光头部高光星点
-            CGPoint headPt = pointOnRectPerimeter(edgeRect, flow);
-            [[accentCol colorWithAlphaComponent:0.35] setFill];
-            [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(headPt.x - 9.0, headPt.y - 9.0, 18.0, 18.0)] fill];
-            [[UIColor whiteColor] setFill];
-            [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(headPt.x - 3.5, headPt.y - 3.5, 7.0, 7.0)] fill];
-        } else {
-            UIBezierPath *idleBorder = [UIBezierPath bezierPathWithRoundedRect:edgeRect cornerRadius:18.0];
-            idleBorder.lineWidth = 2.0;
-            [[UIColor colorWithWhite:1.0 alpha:0.12] setStroke];
-            [idleBorder stroke];
-        }
-
-        // 左侧状态呼吸灯
-        double pulseWave = 0.55 + 0.45 * sin(flow * M_PI * 2.0);
-        if (running) {
-            [[accentCol colorWithAlphaComponent:(0.18 + 0.18 * pulseWave)] setFill];
-            [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(20.0, 22.0, 26.0, 26.0)] fill];
-        }
-        [[accentCol colorWithAlphaComponent:(running ? (0.75 + 0.25 * pulseWave) : 0.65)] setFill];
-        [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(26.0, 28.0, 14.0, 14.0)] fill];
-
-        // 主标题
-        NSString *headline = !running
-            ? @"米塔 · 控制未启动"
-            : (isThinking ? @"AI 控制回复中" : @"AI 控制启动中");
-        NSDictionary *headAttrs = @{
-            NSFontAttributeName: [UIFont boldSystemFontOfSize:23.0],
-            NSForegroundColorAttributeName: [UIColor whiteColor]
-        };
-        [headline drawInRect:CGRectMake(50.0, 20.0, 240.0, 32.0) withAttributes:headAttrs];
-
-        // 右上角醒目实时计时 + 回复数胶囊
-        NSString *badgeTxt = running
-            ? [NSString stringWithFormat:@"⏱ %@ · 已回 %ld", timerStr, (long)repliedCnt]
-            : [NSString stringWithFormat:@"待命 · 已回 %ld", (long)repliedCnt];
-        NSDictionary *badgeAttrs = @{
-            NSFontAttributeName: [UIFont monospacedDigitSystemFontOfSize:17.5 weight:UIFontWeightBold],
-            NSForegroundColorAttributeName: running ? [UIColor whiteColor] : accentCol
-        };
-        CGSize bSz = [badgeTxt sizeWithAttributes:badgeAttrs];
-        CGRect pillRect = CGRectMake(width - bSz.width - 42.0, 19.0, bSz.width + 22.0, 32.0);
-        [[accentCol colorWithAlphaComponent:(running ? 0.30 : 0.15)] setFill];
-        [[UIBezierPath bezierPathWithRoundedRect:pillRect cornerRadius:16.0] fill];
-        [badgeTxt drawAtPoint:CGPointMake(pillRect.origin.x + 11.0, pillRect.origin.y + 5.0) withAttributes:badgeAttrs];
-
-        // 副标题：实时 API 模型
-        NSString *subModel = [NSString stringWithFormat:@"实时 API：%@", model];
-        NSDictionary *subAttrs = @{
-            NSFontAttributeName: [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold],
-            NSForegroundColorAttributeName: accentCol
-        };
-        [subModel drawInRect:CGRectMake(24.0, 62.0, width - 48.0, 24.0) withAttributes:subAttrs];
-
-        // 底部实况文字
-        NSMutableParagraphStyle *ps = [[NSMutableParagraphStyle alloc] init];
-        ps.lineBreakMode = NSLineBreakByTruncatingTail;
-        ps.lineSpacing = 2.0;
-        NSDictionary *lineAttrs = @{
-            NSFontAttributeName: [UIFont systemFontOfSize:18.5 weight:UIFontWeightMedium],
-            NSForegroundColorAttributeName: [UIColor colorWithRed:0.92 green:0.95 blue:0.99 alpha:1.0],
-            NSParagraphStyleAttributeName: ps
-        };
-        [line drawInRect:CGRectMake(24.0, 96.0, width - 48.0, 60.0) withAttributes:lineAttrs];
-
-        UIGraphicsPopContext();
-        CGContextRelease(ctx);
+    [self writeAndNotifyEdgeState];
+    if (![MitaConfigStore shared].floatingHudEnabled) {
+        [self terminateOverlayDaemon];
     }
-    CGColorSpaceRelease(cs);
-    CVPixelBufferUnlockBaseAddress(pxBuf, 0);
+}
 
-    CMVideoFormatDescriptionRef fmt = NULL;
-    if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pxBuf, &fmt) == noErr && fmt) {
-        CMSampleTimingInfo timing;
-        timing.presentationTimeStamp = CMClockGetTime(CMClockGetHostTimeClock());
-        timing.duration = CMTimeMake(1, 10);
-        timing.decodeTimeStamp = kCMTimeInvalid;
-
-        CMSampleBufferRef sbuf = NULL;
-        if (CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pxBuf, fmt, &timing, &sbuf) == noErr && sbuf) {
-            CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sbuf, true);
-            if (attachments && CFArrayGetCount(attachments) > 0) {
-                CFMutableDictionaryRef dict = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
-                CFDictionarySetValue(dict, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
-            }
-            [self.sampleLayer enqueueSampleBuffer:sbuf];
-            CFRelease(sbuf);
+- (NSDictionary *)overlayDiagnostics {
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    out[@"daemon_alive"] = @([self isDaemonAlive]);
+    out[@"helper_exists"] = @([[NSFileManager defaultManager] fileExistsAtPath:[self helperBinaryPath]]);
+    NSData *d = [NSData dataWithContentsOfFile:[self diagFilePath]];
+    if (d.length > 0) {
+        id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if ([obj isKindOfClass:[NSDictionary class]]) {
+            out[@"diag"] = obj;
         }
-        CFRelease(fmt);
     }
-    CVPixelBufferRelease(pxBuf);
-}
-
-#pragma mark - AVPictureInPictureSampleBufferPlaybackDelegate
-
-- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
-                        setPlaying:(BOOL)playing {
-    [[MitaAiGroupEngine shared] setAutoReplyRunning:playing launchWeChat:NO triggerSource:@"pip_hud"];
-    [pictureInPictureController invalidatePlaybackState];
-}
-
-- (CMTimeRange)pictureInPictureControllerTimeRangeForPlayback:(AVPictureInPictureController *)pictureInPictureController {
-    return CMTimeRangeMake(kCMTimeZero, kCMTimePositiveInfinity);
-}
-
-- (BOOL)pictureInPictureControllerIsPlaybackPaused:(AVPictureInPictureController *)pictureInPictureController {
-    return !self.curRunning;
-}
-
-- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
-         didTransitionToRenderSize:(CMVideoDimensions)newRenderSize {
-}
-
-- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
-                    skipByInterval:(CMTime)skipInterval
-                 completionHandler:(void (^)(void))completionHandler {
-    if (completionHandler) completionHandler();
-}
-
-- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController
-restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL))completionHandler {
-    if (completionHandler) completionHandler(YES);
+    return out;
 }
 
 @end

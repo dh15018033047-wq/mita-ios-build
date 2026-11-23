@@ -2,6 +2,7 @@
 #import "MitaConfigStore.h"
 #import "MitaKeepAliveAndControl.h"
 #import "MitaAiGroupEngine.h"
+#import "MitaFloatingHudManager.h"
 #import <UIKit/UIKit.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
@@ -67,7 +68,7 @@
         @"platform": @"ios",
         @"app": @"MitaPhoneAgent",
         @"app_title": @"米塔 手机智能体 (巨魔版)",
-        @"version": @"2.8.0",
+        @"version": @"3.0.0",
         @"model": [MitaKeepAliveAndControl deviceModelName],
         @"ios_version": [UIDevice currentDevice].systemVersion ?: @"15.8.2",
         @"width": @((int)nb.size.width),
@@ -80,6 +81,7 @@
         @"bot_enabled": @(store.botEnabled),
         @"bot_running": @([MitaAiGroupEngine shared].isAutoReplyRunning),
         @"floating_hud_enabled": @(store.floatingHudEnabled),
+        @"edge_overlay": [[MitaFloatingHudManager shared] overlayDiagnostics],
         @"runtime_monitor": [[MitaAiGroupEngine shared] runtimeStatusSnapshot],
         @"whitelist_only": @(store.whitelistOnly),
         @"persona_id": store.personaId,
@@ -238,8 +240,16 @@
     } else if ([path isEqualToString:@"/action"] && [method isEqualToString:@"POST"]) {
         id inObj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : @{};
         NSDictionary *act = [inObj isKindOfClass:[NSDictionary class]] ? inObj : @{};
+        [[MitaFloatingHudManager shared] triggerControlPulseSeconds:6.5 phase:@"controlling"];
         NSArray *steps = [[MitaKeepAliveAndControl shared] executeActionBatch:@[act]];
         respObj = @{@"ok": @(YES), @"steps": steps};
+    } else if ([path isEqualToString:@"/edge_pulse"]) {
+        id inObj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : @{};
+        NSDictionary *dict = [inObj isKindOfClass:[NSDictionary class]] ? inObj : @{};
+        double sec = dict[@"seconds"] ? [dict[@"seconds"] doubleValue] : 6.0;
+        NSString *ph = [dict[@"phase"] isKindOfClass:[NSString class]] ? dict[@"phase"] : @"controlling";
+        [[MitaFloatingHudManager shared] triggerControlPulseSeconds:sec phase:ph];
+        respObj = @{@"ok": @(YES), @"edge_overlay": [[MitaFloatingHudManager shared] overlayDiagnostics]};
     } else {
         code = 404;
         respObj = @{@"ok": @(NO), @"error": [NSString stringWithFormat:@"Not found: %@", path]};
