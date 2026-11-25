@@ -58,7 +58,7 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
         _curStartedAtTs = 0.0;
         _pulseUntilTs = 0.0;
         _curPhase = @"idle";
-        _curModel = @"grok-4.7";
+        _curModel = @"gemini-4-neon-xhigh";
         _curRepliedCount = 0;
         _curStatusLine = @"点击「立即启动」开启全局屏幕边缘蓝色波浪控制";
         [self ensureKeepSyncTimerStarted];
@@ -109,12 +109,12 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
 }
 
 - (BOOL)isActive {
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    return [MitaConfigStore shared].floatingHudEnabled && (self.curRunning || self.pulseUntilTs > now) && [self isDaemonAlive];
+    BOOL remoteOn = [MitaConfigStore shared].remoteControlEnabled;
+    return [MitaConfigStore shared].floatingHudEnabled && remoteOn && [self isDaemonAlive];
 }
 
 - (BOOL)ensureOverlayDaemonLaunched {
-    if (![MitaConfigStore shared].floatingHudEnabled) return NO;
+    if (![MitaConfigStore shared].floatingHudEnabled || ![MitaConfigStore shared].remoteControlEnabled) return NO;
     if ([self isDaemonAlive]) return YES;
 
     NSString *binPath = [self helperBinaryPath];
@@ -182,23 +182,43 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
     NSTimeInterval startTs = self.curStartedAtTs;
     NSTimeInterval pulseTs = self.pulseUntilTs;
     NSString *phase = self.curPhase ?: @"idle";
-    NSString *model = self.curModel ?: @"grok-4.7";
+    NSString *model = self.curModel ?: @"gemini-4-neon-xhigh";
     NSInteger repCnt = self.curRepliedCount;
     NSString *line = self.curStatusLine ?: @"";
     [self.stateLock unlock];
 
     BOOL edgeEn = [MitaConfigStore shared].floatingHudEnabled;
+    BOOL remoteOn = [MitaConfigStore shared].remoteControlEnabled;
+    BOOL effectiveRunning = remoteOn ? (remoteOn || running) : NO;
+    NSString *effectivePhase = phase;
+    if (!remoteOn) {
+        effectiveRunning = NO;
+        pulseTs = 0.0;
+        effectivePhase = @"idle";
+    } else if (remoteOn && !running) {
+        if ([effectivePhase isEqualToString:@"idle"] || effectivePhase.length == 0) {
+            effectivePhase = @"remote";
+        }
+        if (startTs <= 0) {
+            startTs = [[NSDate date] timeIntervalSince1970];
+            [self.stateLock lock];
+            if (_curStartedAtTs <= 0) _curStartedAtTs = startTs;
+            startTs = _curStartedAtTs;
+            [self.stateLock unlock];
+        }
+    }
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (edgeEn && (running || pulseTs > now)) {
+    if (edgeEn && remoteOn) {
         [self ensureOverlayDaemonLaunched];
     }
 
     NSDictionary *payload = @{
         @"edge_enabled": @(edgeEn),
-        @"running": @(running),
+        @"running": @(effectiveRunning),
+        @"remote_enabled": @(remoteOn),
         @"started_at": @(startTs),
         @"pulse_until": @(pulseTs),
-        @"phase": phase,
+        @"phase": effectivePhase,
         @"model": model,
         @"replied_count": @(repCnt),
         @"status_line": line,
@@ -236,26 +256,36 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
 
 - (void)attachToHostView:(UIView *)hostView {
     [self ensureKeepSyncTimerStarted];
-    // 立即预热系统级全屏无感穿透边缘波浪守护进程（退后台由高优先级 GCD dispatch_source_t 每 3 秒守护自愈）
+    // 仅在悬浮层与远程总控同时开启时预热守护进程；若远程总控关闭则确保守护进程停止
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        if ([MitaConfigStore shared].floatingHudEnabled) {
+        if ([MitaConfigStore shared].floatingHudEnabled && [MitaConfigStore shared].remoteControlEnabled) {
             [self ensureOverlayDaemonLaunched];
+            [self writeAndNotifyEdgeState];
+        } else {
+            [self stopFloatingWindow];
         }
-        [self writeAndNotifyEdgeState];
     });
 }
 
 - (void)onHeartbeatRefresh {
-    if (![MitaConfigStore shared].floatingHudEnabled) return;
+    BOOL hudOn = [MitaConfigStore shared].floatingHudEnabled;
+    BOOL remoteOn = [MitaConfigStore shared].remoteControlEnabled;
+    if (!hudOn || !remoteOn) {
+        if ([self isDaemonAlive]) {
+            [self stopFloatingWindow];
+        }
+        return;
+    }
+
     [self.stateLock lock];
     BOOL running = self.curRunning;
     NSTimeInterval pulseTs = self.pulseUntilTs;
     [self.stateLock unlock];
 
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    BOOL shouldKeepWave = (running || pulseTs > now);
+    BOOL shouldKeepWave = (remoteOn || running || pulseTs > now);
 
-    // 每 3.0 秒检查守护进程存活，若意外退出则 1 秒内立即自动拉起并同步最新状态！
+    // 每 3.0 秒检查守护进程存活，仅在 hudOn && remoteOn 为真时自动拉起并同步最新状态
     if (![self isDaemonAlive]) {
         if ([self ensureOverlayDaemonLaunched]) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
@@ -327,8 +357,35 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
     [self.stateLock lock];
     _pulseUntilTs = 0.0;
     [self.stateLock unlock];
+
+    // 1. 先向本机 :19081/action 短超时 POST 立即隐藏悬浮胶囊与释放窗口
+    NSURL *u = [NSURL URLWithString:@"http://127.0.0.1:19081/action"];
+    if (u) {
+        NSDictionary *offPayload = @{
+            @"action": @"set_control_mode",
+            @"mode": @"off",
+            @"remote_enabled": @(NO)
+        };
+        NSData *body = [NSJSONSerialization dataWithJSONObject:offPayload options:0 error:nil];
+        if (body) {
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
+            req.HTTPMethod = @"POST";
+            req.timeoutInterval = 0.30;
+            [req setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+            req.HTTPBody = body;
+            [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+                dispatch_semaphore_signal(sem);
+            }] resume];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)));
+        }
+    }
+
+    // 2. 写入最新 mita_edge_state.json 并广播
     [self writeAndNotifyEdgeState];
-    if (![MitaConfigStore shared].floatingHudEnabled) {
+
+    // 3. 只要关闭了悬浮框或关闭了远程总控，立即彻底终止 :19081 守护进程！
+    if (![MitaConfigStore shared].floatingHudEnabled || ![MitaConfigStore shared].remoteControlEnabled) {
         [self terminateOverlayDaemon];
     }
 }

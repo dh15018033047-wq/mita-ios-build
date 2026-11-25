@@ -610,19 +610,41 @@
         @"stream": @(NO),
         @"max_tokens": @(jsonMode ? 480 : 320)
     } mutableCopy];
-    if (isGrok) payload[@"reasoning_effort"] = @"minimal";
+    NSString *effort = store.reasoningEffort ?: @"low";
+    if ([effort isEqualToString:@"auto"]) {
+        if (isGrok) payload[@"reasoning_effort"] = @"minimal";
+    } else if (effort.length > 0) {
+        payload[@"reasoning_effort"] = effort;
+    }
     if (jsonMode) payload[@"response_format"] = @{@"type": @"json_object"};
 
     NSURL *url = [NSURL URLWithString:[base stringByAppendingString:@"/chat/completions"]];
+    [self sendChatRequestToUrl:url
+                        apiKey:apiKey
+                         model:model
+                      jsonMode:jsonMode
+                       payload:payload
+           allowEffortFallback:YES
+                    completion:completion];
+}
+
+- (void)sendChatRequestToUrl:(NSURL *)url
+                      apiKey:(NSString *)apiKey
+                       model:(NSString *)model
+                    jsonMode:(BOOL)jsonMode
+                     payload:(NSDictionary *)bodyDict
+         allowEffortFallback:(BOOL)allowEffortFallback
+                  completion:(void (^)(BOOL ok, NSString *content, NSString *model, NSInteger costMs, NSString *error))completion {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.HTTPMethod = @"POST";
     [req setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
     [req setValue:@"application/json" forHTTPHeaderField:@"Accept"];
     [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148" forHTTPHeaderField:@"User-Agent"];
     [req setValue:[NSString stringWithFormat:@"Bearer %@", apiKey] forHTTPHeaderField:@"Authorization"];
-    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:bodyDict options:0 error:nil];
 
     NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
+    __weak typeof(self) weakSelf = self;
     [[self.urlSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         NSInteger costMs = (NSInteger)llround(([[NSDate date] timeIntervalSince1970] - t0) * 1000.0);
         if (err || !data) {
@@ -632,6 +654,21 @@
         NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)resp;
         NSInteger code = httpResp.statusCode;
         id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (code == 400 && allowEffortFallback && bodyDict[@"reasoning_effort"] != nil) {
+            NSString *rawErr = [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"" lowercaseString];
+            if ([rawErr containsString:@"reasoning"] || [rawErr containsString:@"effort"] || [rawErr containsString:@"unsupported"] || [rawErr containsString:@"invalid"]) {
+                NSMutableDictionary *retryBody = [bodyDict mutableCopy];
+                [retryBody removeObjectForKey:@"reasoning_effort"];
+                [weakSelf sendChatRequestToUrl:url
+                                        apiKey:apiKey
+                                         model:model
+                                      jsonMode:jsonMode
+                                       payload:retryBody
+                           allowEffortFallback:NO
+                                    completion:completion];
+                return;
+            }
+        }
         if (code < 200 || code >= 300 || ![obj isKindOfClass:[NSDictionary class]]) {
             NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
             if (raw.length > 140) raw = [[raw substringToIndex:140] stringByAppendingString:@"..."];
@@ -795,15 +832,17 @@
         return;
     }
 
-    // 整理需要请求的 Key 列表：若用户手动填了新 Key 则仅用该 Key；否则同时尝试主 Key 与备用 Gemini Key 合并该中转站全部可用模型
+    // 整理需要请求的 Key：若用户手填了新 Key 仅用新 Key；否则优先用当前主 Key（避免混入已弃用备用 Key 的旧模型）
     NSMutableArray<NSString *> *keysToTry = [NSMutableArray array];
     NSString *manualKey = [apiKey ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (manualKey.length > 0 && ![manualKey containsString:@"****"]) {
         [keysToTry addObject:manualKey];
+    } else if (store.apiKey.length > 0) {
+        [keysToTry addObject:store.apiKey];
+    } else if (store.geminiApiKey.length > 0) {
+        [keysToTry addObject:store.geminiApiKey];
     } else {
-        if (store.apiKey.length > 0) [keysToTry addObject:store.apiKey];
-        if (store.geminiApiKey.length > 0 && ![keysToTry containsObject:store.geminiApiKey]) [keysToTry addObject:store.geminiApiKey];
-        if (keysToTry.count == 0) [keysToTry addObject:@""];
+        [keysToTry addObject:@""];
     }
 
     NSURL *url = [NSURL URLWithString:[base stringByAppendingString:@"/models"]];
@@ -852,13 +891,30 @@
                     for (id row in rows) {
                         NSString *mid = nil;
                         if ([row isKindOfClass:[NSDictionary class]]) {
-                            mid = [row[@"id"] isKindOfClass:[NSString class]] ? row[@"id"] : ([row[@"name"] isKindOfClass:[NSString class]] ? row[@"name"] : nil);
+                            NSDictionary *rd = (NSDictionary *)row;
+                            if ([rd[@"disabled"] boolValue] || [rd[@"is_disabled"] boolValue]) continue;
+                            if (rd[@"enabled"] != nil && ![rd[@"enabled"] boolValue]) continue;
+                            if (rd[@"is_enabled"] != nil && ![rd[@"is_enabled"] boolValue]) continue;
+                            if (rd[@"active"] != nil && ![rd[@"active"] boolValue]) continue;
+                            NSString *stStr = [[rd[@"status"] isKindOfClass:[NSString class]] ? rd[@"status"] : @"" lowercaseString];
+                            if ([stStr isEqualToString:@"disabled"] || [stStr isEqualToString:@"inactive"] || [stStr isEqualToString:@"off"]) continue;
+                            mid = [rd[@"id"] isKindOfClass:[NSString class]] ? rd[@"id"] : ([rd[@"name"] isKindOfClass:[NSString class]] ? rd[@"name"] : nil);
                         } else if ([row isKindOfClass:[NSString class]]) {
                             mid = (NSString *)row;
                         }
                         mid = [mid ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
                         NSString *low = [mid lowercaseString];
-                        if (mid.length > 0 && ![low containsString:@"embedding"] && ![low containsString:@"whisper"] && ![low containsString:@"tts-"] && ![low containsString:@"dall-e"] && ![low containsString:@"flux"] && ![low containsString:@"moderation"]) {
+                        if ([low hasPrefix:@"models/"]) low = [low substringFromIndex:7];
+                        if (mid.length > 0
+                            && [low hasPrefix:@"gemini"]
+                            && ![low containsString:@"embedding"]
+                            && ![low containsString:@"whisper"]
+                            && ![low containsString:@"tts-"]
+                            && ![low containsString:@"dall-e"]
+                            && ![low containsString:@"flux"]
+                            && ![low containsString:@"moderation"]
+                            && ![low containsString:@"image"]
+                            && ![low containsString:@"imagine"]) {
                             [merged addObject:mid];
                         }
                     }
@@ -874,8 +930,14 @@
     dispatch_group_notify(grp, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSArray<NSString *> *list = [merged array];
         if (list.count > 0) {
-            store.fetchedModels = list;
-            completion(@{@"ok": @(YES), @"models": list, @"count": @(list.count)});
+            NSString *nextModel = (store.apiModel.length > 0 && [list containsObject:store.apiModel])
+                ? store.apiModel
+                : list.firstObject;
+            [store updateFromDictionary:@{
+                @"fetched_models": list,
+                @"api_model": nextModel ?: @""
+            }];
+            completion(@{@"ok": @(YES), @"models": list, @"active_model": store.apiModel ?: @"", @"count": @(list.count)});
         } else if (anySuccess) {
             completion(@{@"ok": @(NO), @"error": @"上游接口连通但未返回可用对话模型"});
         } else {
@@ -988,7 +1050,7 @@
     NSInteger cCopy = self.totalRepliedCount;
     [self.guardLock unlock];
 
-    NSString *model = [MitaConfigStore shared].apiModel ?: @"grok-4.7";
+    NSString *model = [MitaConfigStore shared].apiModel ?: @"gemini-4-neon-xhigh";
     [[MitaFloatingHudManager shared] updateWithRunning:running
                                            startedAtTs:stTs
                                                  phase:pCopy
@@ -1010,7 +1072,7 @@
         @"last_contact": self.monitorLastContact ?: @"",
         @"last_message": self.monitorStatusLine ?: @"",
         @"replied_count": @(self.totalRepliedCount),
-        @"model": [MitaConfigStore shared].apiModel ?: @"grok-4.7"
+        @"model": [MitaConfigStore shared].apiModel ?: @"gemini-4-neon-xhigh"
     };
     [self.guardLock unlock];
     return snap;
@@ -1045,12 +1107,16 @@
         if (store.floatingHudEnabled) {
             [[MitaFloatingHudManager shared] syncPlaybackState];
         }
+        [self notifyLocalOverlayControlMode:@"ai_locked"];
     } else {
         [self updateRuntimePhase:@"idle"
                       engineMode:@"已停止"
                      lastContact:self.monitorLastContact ?: @""
                       statusLine:@"已停止自动回复，点击主按钮可随时重新启动"
                     repliedCount:self.totalRepliedCount];
+        if (![source isEqualToString:@"pc_remote"]) {
+            [self notifyLocalOverlayControlMode:@"idle"];
+        }
     }
 
     // 同步通知电脑端开启或停止高速巡检守护（除非本次调用本身就是电脑端反向推过来的）
@@ -1076,6 +1142,18 @@
         @"runtime_monitor": [self runtimeStatusSnapshot],
         @"message": running ? @"微信自动回复已启动运行" : @"微信自动回复已停止"
     };
+}
+
+- (void)notifyLocalOverlayControlMode:(NSString *)modeStr {
+    NSURL *u = [NSURL URLWithString:@"http://127.0.0.1:19081/action"];
+    if (!u) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
+    req.HTTPMethod = @"POST";
+    req.timeoutInterval = 1.2;
+    [req setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+    NSDictionary *body = @{@"action": @"set_control_mode", @"mode": modeStr ?: @"idle", @"ttl_sec": @(86400)};
+    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    [[self.urlSession dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {}] resume];
 }
 
 - (void)notifyPcToggleRunning:(BOOL)running {

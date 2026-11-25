@@ -117,13 +117,14 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
         @"api_base_url": seed[@"api_base_url"] ?: @"https://api.2889372.xyz/v1",
         @"api_key": seed[@"api_key"] ?: @"",
         @"gemini_api_key": seed[@"gemini_api_key"] ?: @"",
-        @"api_model": seed[@"api_model"] ?: @"gemini-3.5-flash-lite",
+        @"api_model": seed[@"api_model"] ?: @"gemini-4-neon-xhigh",
+        @"reasoning_effort": seed[@"reasoning_effort"] ?: @"xhigh",
         @"pc_sync_url": seed[@"pc_sync_url"] ?: @"http://192.168.1.34:18765",
         @"persona_id": seed[@"persona_id"] ?: @"sweet",
         @"custom_prompt": [self promptForPersonaId:(seed[@"persona_id"] ?: @"sweet")],
         @"admin_contacts": seed[@"admin_contacts"] ?: @[@"00"],
         @"admin_wxids": seed[@"admin_wxids"] ?: @[@"kazuma670", @"00670"],
-        @"fetched_models": seed[@"fetched_models"] ?: @[@"gemini-3.5-flash-lite", @"grok-4.7"],
+        @"fetched_models": seed[@"fetched_models"] ?: @[@"gemini-4-neon-xhigh", @"gemini-4-hydrogen-xhigh"],
         @"allowed_contacts": seed[@"allowed_contacts"] ?: @[@"00", @"00670", @"kazuma670", @"小鲸鱼", @"小金鱼", @"懒洋洋"],
         @"allowed_groups": seed[@"allowed_groups"] ?: @[],
         @"group_keywords": seed[@"group_keywords"] ?: @"豆奶,@豆奶,小鲸鱼,@小鲸鱼,鲸鲸,米塔",
@@ -206,6 +207,21 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
 
 #pragma mark - Property Accessors
 
+- (BOOL)remoteControlEnabled { [self.lock lock]; BOOL v = self.data[@"remote_control_enabled"] ? [self.data[@"remote_control_enabled"] boolValue] : YES; [self.lock unlock]; return v; }
+- (void)setRemoteControlEnabled:(BOOL)v { [self.lock lock]; self.data[@"remote_control_enabled"] = @(v); [self saveLocked]; [self.lock unlock]; }
+
+- (BOOL)antiBurninEnabled { [self.lock lock]; BOOL v = self.data[@"anti_burnin_enabled"] ? [self.data[@"anti_burnin_enabled"] boolValue] : YES; [self.lock unlock]; return v; }
+- (void)setAntiBurninEnabled:(BOOL)v { [self.lock lock]; self.data[@"anti_burnin_enabled"] = @(v); [self saveLocked]; [self.lock unlock]; }
+
+- (NSInteger)antiBurninIntervalSec { [self.lock lock]; NSInteger v = self.data[@"anti_burnin_interval_sec"] ? [self.data[@"anti_burnin_interval_sec"] integerValue] : 180; [self.lock unlock]; return MAX(60, MIN(1800, v)); }
+- (void)setAntiBurninIntervalSec:(NSInteger)v { [self.lock lock]; self.data[@"anti_burnin_interval_sec"] = @(MAX(60, MIN(1800, v))); [self saveLocked]; [self.lock unlock]; }
+
+- (NSInteger)antiBurninCount { [self.lock lock]; NSInteger v = [self.data[@"anti_burnin_count"] integerValue]; [self.lock unlock]; return MAX(0, v); }
+- (void)setAntiBurninCount:(NSInteger)v { [self.lock lock]; self.data[@"anti_burnin_count"] = @(MAX(0, v)); [self saveLocked]; [self.lock unlock]; }
+
+- (double)lastBurninAt { [self.lock lock]; double v = [self.data[@"last_burnin_at"] doubleValue]; [self.lock unlock]; return v; }
+- (void)setLastBurninAt:(double)v { [self.lock lock]; self.data[@"last_burnin_at"] = @(v); [self saveLocked]; [self.lock unlock]; }
+
 - (BOOL)botEnabled { [self.lock lock]; BOOL v = [self.data[@"bot_enabled"] boolValue]; [self.lock unlock]; return v; }
 - (void)setBotEnabled:(BOOL)v { [self.lock lock]; self.data[@"bot_enabled"] = @(v); [self saveLocked]; [self.lock unlock]; }
 
@@ -270,8 +286,19 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
 - (NSString *)geminiApiKey { return [self strForKey:@"gemini_api_key" def:@""]; }
 - (void)setGeminiApiKey:(NSString *)v { [self setStr:v forKey:@"gemini_api_key"]; }
 
-- (NSString *)apiModel { return [self strForKey:@"api_model" def:@"gemini-3.5-flash-lite"]; }
+- (NSString *)apiModel { return [self strForKey:@"api_model" def:@"gemini-4-neon-xhigh"]; }
 - (void)setApiModel:(NSString *)v { [self setStr:v forKey:@"api_model"]; }
+
+- (NSString *)reasoningEffort {
+    NSString *raw = [[self strForKey:@"reasoning_effort" def:@"xhigh"] lowercaseString];
+    NSSet *allowed = [NSSet setWithArray:@[@"auto", @"none", @"minimal", @"low", @"medium", @"high", @"xhigh"]];
+    return [allowed containsObject:raw] ? raw : @"xhigh";
+}
+- (void)setReasoningEffort:(NSString *)v {
+    NSString *raw = [(v ?: @"xhigh") stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]].lowercaseString;
+    NSSet *allowed = [NSSet setWithArray:@[@"auto", @"none", @"minimal", @"low", @"medium", @"high", @"xhigh"]];
+    [self setStr:([allowed containsObject:raw] ? raw : @"xhigh") forKey:@"reasoning_effort"];
+}
 
 - (NSString *)pcSyncUrl { return [self strForKey:@"pc_sync_url" def:@"http://192.168.1.34:18765"]; }
 - (void)setPcSyncUrl:(NSString *)v { [self setStr:v forKey:@"pc_sync_url"]; }
@@ -353,8 +380,28 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
 - (NSArray<NSString *> *)adminWxids { return [self arrForKey:@"admin_wxids" def:@[@"kazuma670", @"00670"]]; }
 - (void)setAdminWxids:(NSArray<NSString *> *)v { [self setArr:v forKey:@"admin_wxids"]; }
 
-- (NSArray<NSString *> *)fetchedModels { return [self arrForKey:@"fetched_models" def:@[@"gemini-3.5-flash-lite", @"grok-4.7"]]; }
-- (void)setFetchedModels:(NSArray<NSString *> *)v { [self setArr:v forKey:@"fetched_models"]; }
+- (NSArray<NSString *> *)fetchedModels {
+    NSArray<NSString *> *raw = [self arrForKey:@"fetched_models" def:@[@"gemini-4-neon-xhigh", @"gemini-4-hydrogen-xhigh", @"gemini-4-argon-high", @"gemini-4-carbon-high"]];
+    NSMutableArray<NSString *> *gemOnly = [NSMutableArray array];
+    for (NSString *m in raw) {
+        NSString *low = [[m lowercaseString] stringByReplacingOccurrencesOfString:@"models/" withString:@""];
+        if ([low hasPrefix:@"gemini"] && ![low containsString:@"image"] && ![gemOnly containsObject:m]) {
+            [gemOnly addObject:m];
+        }
+    }
+    return gemOnly.count > 0 ? gemOnly : @[@"gemini-4-neon-xhigh", @"gemini-4-hydrogen-xhigh"];
+}
+- (void)setFetchedModels:(NSArray<NSString *> *)v {
+    NSMutableArray<NSString *> *gemOnly = [NSMutableArray array];
+    for (NSString *m in (v ?: @[])) {
+        NSString *t = [m stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSString *low = [[t lowercaseString] stringByReplacingOccurrencesOfString:@"models/" withString:@""];
+        if ([low hasPrefix:@"gemini"] && ![low containsString:@"image"] && ![gemOnly containsObject:t]) {
+            [gemOnly addObject:t];
+        }
+    }
+    [self setArr:(gemOnly.count > 0 ? gemOnly : @[@"gemini-4-neon-xhigh"]) forKey:@"fetched_models"];
+}
 
 - (NSArray<NSString *> *)allowedContacts {
     NSMutableArray *base = [[self arrForKey:@"allowed_contacts" def:@[@"00", @"00670", @"kazuma670"]] mutableCopy];
@@ -430,6 +477,7 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
     if (![dict isKindOfClass:[NSDictionary class]]) return;
     [self.lock lock];
     NSArray *boolKeys = @[
+        @"remote_control_enabled", @"anti_burnin_enabled",
         @"bot_enabled", @"bot_running", @"floating_hud_enabled", @"keep_alive_enabled", @"whitelist_only", @"block_new_friends",
         @"block_marketing", @"admin_wechat_control", @"recognize_admin_in_group", @"verify_admin_avatar_wxid",
         @"group_split_bubbles", @"ad_guard_enabled", @"auto_kick_enabled", @"auto_approve_join_enabled"
@@ -440,13 +488,19 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
         }
     }
     NSArray *strKeys = @[
-        @"api_base_url", @"api_model", @"pc_sync_url", @"custom_prompt",
+        @"api_base_url", @"api_model", @"reasoning_effort", @"pc_sync_url", @"custom_prompt",
         @"group_keywords", @"group_vibe_mode", @"group_perm_mode",
         @"ad_keywords", @"ad_warn_template", @"ad_kick_template"
     ];
     for (NSString *k in strKeys) {
         if ([dict[k] isKindOfClass:[NSString class]]) {
             NSString *val = [(NSString *)dict[k] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if ([k isEqualToString:@"api_model"] && val.length > 0) {
+                NSString *lowM = [[val stringByReplacingOccurrencesOfString:@"models/" withString:@""] lowercaseString];
+                if (![lowM hasPrefix:@"gemini"] || [lowM containsString:@"image"] || [lowM containsString:@"imagine"]) {
+                    val = @"gemini-4-neon-xhigh";
+                }
+            }
             if (val.length > 0 || [k isEqualToString:@"pc_sync_url"]) {
                 self.data[k] = val;
             }
@@ -473,9 +527,24 @@ static NSString *const kPrefSuiteKey = @"mita_ios_agent_cfg_v3";
     ];
     for (NSString *k in arrKeys) {
         if (dict[k] != nil && dict[k] != [NSNull null]) {
-            self.data[k] = [MitaConfigStore splitCsvList:dict[k]];
+            NSArray<NSString *> *parsedArr = [MitaConfigStore splitCsvList:dict[k]];
+            if ([k isEqualToString:@"fetched_models"]) {
+                NSMutableArray<NSString *> *gemArr = [NSMutableArray array];
+                for (NSString *m in parsedArr) {
+                    NSString *lowM = [[m stringByReplacingOccurrencesOfString:@"models/" withString:@""] lowercaseString];
+                    if ([lowM hasPrefix:@"gemini"] && ![lowM containsString:@"image"] && ![lowM containsString:@"imagine"]) {
+                        [gemArr addObject:m];
+                    }
+                }
+                self.data[k] = gemArr.count > 0 ? gemArr : @[@"gemini-4-neon-xhigh", @"gemini-4-hydrogen-xhigh", @"gemini-4-argon-high", @"gemini-4-carbon-high"];
+            } else {
+                self.data[k] = parsedArr;
+            }
         }
     }
+    if (dict[@"anti_burnin_interval_sec"] != nil) self.data[@"anti_burnin_interval_sec"] = @(MAX(60, MIN(1800, [dict[@"anti_burnin_interval_sec"] integerValue])));
+    if (dict[@"anti_burnin_count"] != nil) self.data[@"anti_burnin_count"] = @(MAX(0, [dict[@"anti_burnin_count"] integerValue]));
+    if (dict[@"last_burnin_at"] != nil) self.data[@"last_burnin_at"] = @([dict[@"last_burnin_at"] doubleValue]);
     if (dict[@"group_burst_min"] != nil) self.data[@"group_burst_min"] = @(MAX(1, MIN(8, [dict[@"group_burst_min"] integerValue])));
     if (dict[@"group_burst_max"] != nil) self.data[@"group_burst_max"] = @(MAX(1, MIN(10, [dict[@"group_burst_max"] integerValue])));
     if (dict[@"max_replies_per_hour"] != nil) self.data[@"max_replies_per_hour"] = @(MAX(5, [dict[@"max_replies_per_hour"] integerValue]));

@@ -14,8 +14,8 @@
 @implementation AppDelegate
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
-    [MitaConfigStore shared];
-    if ([MitaConfigStore shared].keepAliveEnabled || [MitaConfigStore shared].botRunning) {
+    MitaConfigStore *store = [MitaConfigStore shared];
+    if (store.remoteControlEnabled || store.keepAliveEnabled || store.botRunning) {
         [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
     }
     [[MitaLanServer shared] startOnPort:19080];
@@ -25,26 +25,35 @@
     self.window.rootViewController = self.rootVC;
     [self.window makeKeyAndVisible];
 
-    // 恢复上次已启动的微信自动回复巡检守护
-    [[MitaAiGroupEngine shared] bootstrapRuntimeIfNeeded];
+    // 同步全局远程控制边缘流光状态（不再绑死微信自动回复！）
+    [[MitaFloatingHudManager shared] syncPlaybackState];
+    // 仅当远程总控与微信模块均开启时，恢复微信自动回复模块守护
+    if (store.remoteControlEnabled) {
+        [[MitaAiGroupEngine shared] bootstrapRuntimeIfNeeded];
+    }
     return YES;
 }
 
 - (void)applicationDidBecomeActive:(UIApplication *)application {
-    if ([MitaConfigStore shared].keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning) {
+    MitaConfigStore *store = [MitaConfigStore shared];
+    if (store.remoteControlEnabled || store.keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning) {
         [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
     }
+    [[MitaLanServer shared] restartListenerIfNeeded];
+    [[MitaFloatingHudManager shared] syncPlaybackState];
     [self.rootVC notifyHostResume];
 }
 
 - (void)applicationWillResignActive:(UIApplication *)application {
-    if ([MitaAiGroupEngine shared].isAutoReplyRunning && [MitaConfigStore shared].floatingHudEnabled) {
+    MitaConfigStore *store = [MitaConfigStore shared];
+    if ((store.remoteControlEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning) && store.floatingHudEnabled) {
         [[MitaFloatingHudManager shared] syncPlaybackState];
     }
 }
 
 - (void)applicationDidEnterBackground:(UIApplication *)application {
-    if ([MitaConfigStore shared].keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning) {
+    MitaConfigStore *store = [MitaConfigStore shared];
+    if (store.remoteControlEnabled || store.keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning) {
         [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
     }
 }

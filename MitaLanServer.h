@@ -6,6 +6,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (instancetype)shared;
 - (void)startOnPort:(int)port;
+- (void)restartListenerIfNeeded;
 - (void)stop;
 @property (nonatomic, readonly) int listenPort;
 @property (nonatomic, readonly) BOOL isRunning;

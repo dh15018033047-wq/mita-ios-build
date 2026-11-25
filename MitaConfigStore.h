@@ -6,6 +6,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (instancetype)shared;
 
+@property (nonatomic, assign) BOOL remoteControlEnabled;
+@property (nonatomic, assign) BOOL antiBurninEnabled;
+@property (nonatomic, assign) NSInteger antiBurninIntervalSec;
+@property (nonatomic, assign) NSInteger antiBurninCount;
+@property (nonatomic, assign) double lastBurninAt;
 @property (nonatomic, assign) BOOL botEnabled;
 @property (nonatomic, assign) BOOL botRunning;
 @property (nonatomic, assign) BOOL floatingHudEnabled;
@@ -25,6 +30,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy) NSString *apiKey;
 @property (nonatomic, copy) NSString *geminiApiKey;
 @property (nonatomic, copy) NSString *apiModel;
+@property (nonatomic, copy) NSString *reasoningEffort;  // auto | none | minimal | low | medium | high | xhigh
 @property (nonatomic, copy) NSString *pcSyncUrl;
 @property (nonatomic, copy) NSString *personaId;
 @property (nonatomic, copy) NSString *customPrompt;

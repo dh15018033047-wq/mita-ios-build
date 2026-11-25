@@ -5,14 +5,21 @@
 #import "MitaFloatingHudManager.h"
 #import <UIKit/UIKit.h>
 #import <sys/socket.h>
+#import <sys/select.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
+#import <signal.h>
 #import <unistd.h>
 
 @interface MitaLanServer ()
 @property (nonatomic, assign, readwrite) int listenPort;
 @property (nonatomic, assign, readwrite) BOOL isRunning;
 @property (nonatomic, assign) int serverFd;
+@property (nonatomic, assign) BOOL needRebind;
+@property (nonatomic, assign) int cachedWidth;
+@property (nonatomic, assign) int cachedHeight;
+@property (nonatomic, copy) NSString *cachedIosVersion;
+@property (nonatomic, copy) NSString *lastBoundIp;
 @property (nonatomic, strong) dispatch_queue_t serverQueue;
 @property (nonatomic, strong) dispatch_source_t heartbeatTimer;
 @end
@@ -30,19 +37,35 @@
 
 - (instancetype)init {
     if (self = [super init]) {
+        signal(SIGPIPE, SIG_IGN);
         _serverFd = -1;
         _listenPort = 19080;
+        _needRebind = NO;
         _serverQueue = dispatch_queue_create("com.mita.phoneagent.lanserver", DISPATCH_QUEUE_CONCURRENT);
+        CGRect nb = [UIScreen mainScreen].nativeBounds;
+        _cachedWidth = (int)nb.size.width;
+        _cachedHeight = (int)nb.size.height;
+        _cachedIosVersion = [[UIDevice currentDevice].systemVersion copy] ?: @"15.8.2";
+        _lastBoundIp = [[MitaKeepAliveAndControl deviceLanIPv4] copy] ?: @"";
     }
     return self;
 }
 
+- (void)restartListenerIfNeeded {
+    if (!self.isRunning) {
+        [self startOnPort:self.listenPort > 0 ? self.listenPort : 19080];
+        return;
+    }
+    self.needRebind = YES;
+}
+
 - (void)startOnPort:(int)port {
     if (self.isRunning) return;
+    signal(SIGPIPE, SIG_IGN);
     self.listenPort = port > 0 ? port : 19080;
     self.isRunning = YES;
 
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self acceptLoop];
     });
     [self startHeartbeatLoop];
@@ -50,9 +73,11 @@
 
 - (void)stop {
     self.isRunning = NO;
-    if (self.serverFd >= 0) {
-        close(self.serverFd);
-        self.serverFd = -1;
+    int fd = self.serverFd;
+    self.serverFd = -1;
+    if (fd >= 0) {
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
     }
     if (self.heartbeatTimer) {
         dispatch_source_cancel(self.heartbeatTimer);
@@ -62,19 +87,23 @@
 
 - (NSDictionary *)buildPingPayload {
     MitaConfigStore *store = [MitaConfigStore shared];
-    CGRect nb = [UIScreen mainScreen].nativeBounds;
     return @{
         @"ok": @(YES),
         @"platform": @"ios",
         @"app": @"MitaPhoneAgent",
         @"app_title": @"米塔 手机智能体 (巨魔版)",
-        @"version": @"3.1.0",
+        @"version": @"5.1.0",
         @"model": [MitaKeepAliveAndControl deviceModelName],
-        @"ios_version": [UIDevice currentDevice].systemVersion ?: @"15.8.2",
-        @"width": @((int)nb.size.width),
-        @"height": @((int)nb.size.height),
+        @"ios_version": self.cachedIosVersion ?: @"15.8.2",
+        @"width": @(self.cachedWidth > 0 ? self.cachedWidth : 1242),
+        @"height": @(self.cachedHeight > 0 ? self.cachedHeight : 2208),
         @"ip": [MitaKeepAliveAndControl deviceLanIPv4],
         @"port": @(self.listenPort),
+        @"remote_control_enabled": @(store.remoteControlEnabled),
+        @"anti_burnin_enabled": @(store.antiBurninEnabled),
+        @"anti_burnin_interval_sec": @(store.antiBurninIntervalSec),
+        @"anti_burnin_count": @(store.antiBurninCount),
+        @"last_burnin_at": @(store.lastBurninAt),
         @"keep_alive": @([MitaKeepAliveAndControl shared].isKeepAliveRunning),
         @"acc_ready": @(YES),
         @"notif_ready": @(YES),
@@ -86,6 +115,7 @@
         @"whitelist_only": @(store.whitelistOnly),
         @"persona_id": store.personaId,
         @"api_model": store.apiModel,
+        @"reasoning_effort": store.reasoningEffort,
         @"hourly_used": @([[MitaAiGroupEngine shared] hourlyUsedCount])
     };
 }
@@ -119,9 +149,15 @@
 - (void)acceptLoop {
     while (self.isRunning) {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) { sleep(2); continue; }
+        if (fd < 0) { sleep(1); continue; }
         int yes = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#ifdef SO_REUSEPORT
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
+#endif
+#ifdef SO_NOSIGPIPE
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+#endif
 
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
@@ -129,21 +165,55 @@
         addr.sin_port = htons((uint16_t)self.listenPort);
         addr.sin_addr.s_addr = INADDR_ANY;
 
-        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(fd, 16) != 0) {
+        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(fd, 32) != 0) {
             close(fd);
-            sleep(2);
+            sleep(1);
             continue;
         }
         self.serverFd = fd;
-        while (self.isRunning) {
+        self.needRebind = NO;
+        self.lastBoundIp = [[MitaKeepAliveAndControl deviceLanIPv4] copy] ?: @"";
+        int idleTicks = 0;
+
+        while (self.isRunning && !self.needRebind) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(fd, &rfds);
+            struct timeval tv;
+            tv.tv_sec = 2;
+            tv.tv_usec = 0;
+            int sel = select(fd + 1, &rfds, NULL, NULL, &tv);
+            if (sel < 0) {
+                break;
+            }
+            if (sel == 0) {
+                idleTicks += 1;
+                // 每 10 秒检查 Wi-Fi IP 是否变化，断网重连后立即重建监听 socket 彻底杜绝 19080 假死！
+                if (idleTicks >= 5) {
+                    idleTicks = 0;
+                    NSString *curIp = [MitaKeepAliveAndControl deviceLanIPv4] ?: @"";
+                    if (curIp.length > 6 && ![curIp isEqualToString:(self.lastBoundIp ?: @"")]) {
+                        self.lastBoundIp = [curIp copy];
+                        break;
+                    }
+                }
+                continue;
+            }
+            idleTicks = 0;
             int client = accept(fd, NULL, NULL);
             if (client < 0) break;
+            int noSig = 1;
+#ifdef SO_NOSIGPIPE
+            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSig, sizeof(noSig));
+#endif
             dispatch_async(self.serverQueue, ^{
                 [self handleClientFd:client];
             });
         }
         close(fd);
-        self.serverFd = -1;
+        if (self.serverFd == fd) {
+            self.serverFd = -1;
+        }
     }
 }
 
@@ -240,6 +310,29 @@
         d[@"ok"] = @(YES);
         d[@"status"] = [self buildPingPayload];
         respObj = d;
+    } else if ([path isEqualToString:@"/toggle_remote"] && [method isEqualToString:@"POST"]) {
+        id inObj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : @{};
+        NSDictionary *dict = [inObj isKindOfClass:[NSDictionary class]] ? inObj : @{};
+        MitaConfigStore *store = [MitaConfigStore shared];
+        if (dict[@"remote_control_enabled"] != nil || dict[@"enabled"] != nil) {
+            BOOL wantRc = dict[@"remote_control_enabled"] != nil ? [dict[@"remote_control_enabled"] boolValue] : [dict[@"enabled"] boolValue];
+            store.remoteControlEnabled = wantRc;
+            if (wantRc) {
+                [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
+                [[MitaFloatingHudManager shared] ensureOverlayDaemonLaunched];
+                [[MitaFloatingHudManager shared] syncPlaybackState];
+            } else {
+                if ([MitaAiGroupEngine shared].isAutoReplyRunning) {
+                    [[MitaAiGroupEngine shared] setAutoReplyRunning:NO launchWeChat:NO triggerSource:@"remote_off"];
+                }
+                [[MitaFloatingHudManager shared] stopFloatingWindow];
+            }
+        }
+        if (dict[@"anti_burnin_enabled"] != nil) store.antiBurninEnabled = [dict[@"anti_burnin_enabled"] boolValue];
+        if (dict[@"anti_burnin_interval_sec"] != nil) store.antiBurninIntervalSec = [dict[@"anti_burnin_interval_sec"] integerValue];
+        if (dict[@"anti_burnin_count"] != nil) store.antiBurninCount = [dict[@"anti_burnin_count"] integerValue];
+        if (dict[@"last_burnin_at"] != nil) store.lastBurninAt = [dict[@"last_burnin_at"] doubleValue];
+        respObj = [self buildPingPayload];
     } else if ([path isEqualToString:@"/toggle_bot"] && [method isEqualToString:@"POST"]) {
         id inObj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : @{};
         NSDictionary *dict = [inObj isKindOfClass:[NSDictionary class]] ? inObj : @{};
@@ -248,10 +341,12 @@
     } else if ([path isEqualToString:@"/action"] && [method isEqualToString:@"POST"]) {
         id inObj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : @{};
         NSDictionary *act = [inObj isKindOfClass:[NSDictionary class]] ? inObj : @{};
-        [[MitaFloatingHudManager shared] triggerControlPulseSeconds:6.5 phase:@"controlling"];
+        if ([MitaConfigStore shared].remoteControlEnabled) {
+            [[MitaFloatingHudManager shared] triggerControlPulseSeconds:6.5 phase:@"controlling"];
+        }
         NSArray *batch = [act[@"actions"] isKindOfClass:[NSArray class]] ? act[@"actions"] : @[act];
         NSArray *steps = [[MitaKeepAliveAndControl shared] executeActionBatch:batch];
-        respObj = @{@"ok": @(YES), @"steps": steps, @"version": @"3.1.0"};
+        respObj = @{@"ok": @(YES), @"steps": steps, @"version": @"5.1.0"};
     } else if ([path isEqualToString:@"/edge_pulse"]) {
         id inObj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : @{};
         NSDictionary *dict = [inObj isKindOfClass:[NSDictionary class]] ? inObj : @{};

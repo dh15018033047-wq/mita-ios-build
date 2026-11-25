@@ -38,6 +38,18 @@
         @"  clearLogs: function() { return this._sync('clearLogs', ''); },\n"
         @"  openPermission: function(kind) { return this._sync('openPermission', kind); },\n"
         @"  controlFloatingHud: function(mode) { return this._sync('controlFloatingHud', mode || 'toggle'); },\n"
+        @"  toggleRemoteControl: function(reqId, enabled) {\n"
+        @"    window.webkit.messageHandlers.mitaAsync.postMessage({method:'toggleRemoteControl', reqId:reqId, args:[Boolean(enabled)]});\n"
+        @"  },\n"
+        @"  updateAntiBurnin: function(reqId, enabled, intervalSec) {\n"
+        @"    window.webkit.messageHandlers.mitaAsync.postMessage({method:'updateAntiBurnin', reqId:reqId, args:[Boolean(enabled), Number(intervalSec || 180)]});\n"
+        @"  },\n"
+        @"  triggerAntiBurninNow: function(reqId) {\n"
+        @"    window.webkit.messageHandlers.mitaAsync.postMessage({method:'triggerAntiBurninNow', reqId:reqId, args:[]});\n"
+        @"  },\n"
+        @"  launchNativeApp: function(reqId, bundleId) {\n"
+        @"    window.webkit.messageHandlers.mitaAsync.postMessage({method:'launchNativeApp', reqId:reqId, args:[bundleId || '']});\n"
+        @"  },\n"
         @"  toggleAutoReply: function(reqId, running, launchWechat) {\n"
         @"    window.webkit.messageHandlers.mitaAsync.postMessage({method:'toggleAutoReply', reqId:reqId, args:[Boolean(running), Boolean(launchWechat)]});\n"
         @"  },\n"
@@ -90,11 +102,16 @@
     NSMutableDictionary *d = [[store toDictionaryRedactingKey:YES] mutableCopy];
     NSString *ip = [MitaKeepAliveAndControl deviceLanIPv4];
     d[@"platform"] = @"ios";
-    d[@"version"] = @"3.1.0";
+    d[@"version"] = @"5.1.0";
     d[@"device_ip"] = ip;
     d[@"lan_endpoint"] = [NSString stringWithFormat:@"http://%@:%d", ip, [MitaLanServer shared].listenPort];
     d[@"device_model"] = [MitaKeepAliveAndControl deviceModelName];
     d[@"ios_version"] = [UIDevice currentDevice].systemVersion ?: @"15.8.2";
+    d[@"remote_control_enabled"] = @(store.remoteControlEnabled);
+    d[@"anti_burnin_enabled"] = @(store.antiBurninEnabled);
+    d[@"anti_burnin_interval_sec"] = @(store.antiBurninIntervalSec);
+    d[@"anti_burnin_count"] = @(store.antiBurninCount);
+    d[@"last_burnin_at"] = @(store.lastBurninAt);
     d[@"keep_alive_running"] = @([MitaKeepAliveAndControl shared].isKeepAliveRunning);
     d[@"troll_signed"] = @(YES);
     d[@"hourly_used"] = @([[MitaAiGroupEngine shared] hourlyUsedCount]);
@@ -140,15 +157,16 @@ completionHandler:(void (^)(NSString * _Nullable))completionHandler {
             NSDictionary *patch = ad ? [NSJSONSerialization JSONObjectWithData:ad options:0 error:nil] : nil;
             if ([patch isKindOfClass:[NSDictionary class]]) {
                 [[MitaConfigStore shared] updateFromDictionary:patch];
-                if ([MitaConfigStore shared].keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning) {
+                if ([MitaConfigStore shared].remoteControlEnabled || [MitaConfigStore shared].keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning) {
                     [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
                 } else {
                     [[MitaKeepAliveAndControl shared] stopSilentKeepAlive];
                 }
-                if (patch[@"floating_hud_enabled"] != nil) {
-                    if (![MitaConfigStore shared].floatingHudEnabled) {
+                if (patch[@"floating_hud_enabled"] != nil || patch[@"remote_control_enabled"] != nil) {
+                    if (![MitaConfigStore shared].floatingHudEnabled || ![MitaConfigStore shared].remoteControlEnabled) {
                         [[MitaFloatingHudManager shared] stopFloatingWindow];
                     } else {
+                        [[MitaFloatingHudManager shared] ensureOverlayDaemonLaunched];
                         [[MitaFloatingHudManager shared] syncPlaybackState];
                     }
                 }
@@ -163,9 +181,11 @@ completionHandler:(void (^)(NSString * _Nullable))completionHandler {
                 [MitaConfigStore shared].floatingHudEnabled = YES;
                 [[MitaFloatingHudManager shared] startFloatingWindow];
             } else if ([arg isEqualToString:@"stop"]) {
+                [MitaConfigStore shared].floatingHudEnabled = NO;
                 [[MitaFloatingHudManager shared] stopFloatingWindow];
             } else {
                 if ([MitaFloatingHudManager shared].isActive) {
+                    [MitaConfigStore shared].floatingHudEnabled = NO;
                     [[MitaFloatingHudManager shared] stopFloatingWindow];
                 } else {
                     [MitaConfigStore shared].floatingHudEnabled = YES;
@@ -213,7 +233,129 @@ completionHandler:(void (^)(NSString * _Nullable))completionHandler {
     NSArray *args = [body[@"args"] isKindOfClass:[NSArray class]] ? body[@"args"] : @[];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        if ([method isEqualToString:@"toggleAutoReply"]) {
+        if ([method isEqualToString:@"toggleRemoteControl"]) {
+            BOOL wantRc = args.count > 0 ? [args[0] boolValue] : YES;
+            MitaConfigStore *store = [MitaConfigStore shared];
+            store.remoteControlEnabled = wantRc;
+            if (wantRc) {
+                [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
+                [[MitaLanServer shared] restartListenerIfNeeded];
+                [[MitaFloatingHudManager shared] ensureOverlayDaemonLaunched];
+                [[MitaFloatingHudManager shared] syncPlaybackState];
+                [store addEventLogKind:@"remote" contact:@"远程总控" incoming:@"" detail:@"已开启全局远程控制（电脑操控/防烧屏/边缘流光就绪，无需开微信）" costMs:0];
+            } else {
+                if ([MitaAiGroupEngine shared].isAutoReplyRunning) {
+                    [[MitaAiGroupEngine shared] setAutoReplyRunning:NO launchWeChat:NO triggerSource:@"remote_master_off"];
+                }
+                [[MitaFloatingHudManager shared] stopFloatingWindow];
+                [store addEventLogKind:@"remote" contact:@"远程总控" incoming:@"" detail:@"已关闭全局远程控制（后台零触控干预）" costMs:0];
+            }
+            // 双向同步到电脑端 /api/remote_control/toggle
+            NSString *pc = [store.pcSyncUrl stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            while ([pc hasSuffix:@"/"]) pc = [pc substringToIndex:pc.length - 1];
+            if (pc.length >= 8) {
+                NSURL *u = [NSURL URLWithString:[pc stringByAppendingString:@"/api/remote_control/toggle"]];
+                if (u) {
+                    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
+                    req.HTTPMethod = @"POST";
+                    req.timeoutInterval = 3.0;
+                    [req setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+                    NSDictionary *p = @{
+                        @"enabled": @(wantRc),
+                        @"ip": [MitaKeepAliveAndControl deviceLanIPv4] ?: @"",
+                        @"source": @"phone_app",
+                        @"sync_phone": @(NO)
+                    };
+                    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:p options:0 error:nil];
+                    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {}] resume];
+                }
+            }
+            NSMutableDictionary *out = [@{@"ok": @(YES), @"remote_control_enabled": @(wantRc)} mutableCopy];
+            NSData *stData = [[self buildFullStateJsonString] dataUsingEncoding:NSUTF8StringEncoding];
+            id stObj = stData ? [NSJSONSerialization JSONObjectWithData:stData options:0 error:nil] : nil;
+            if (stObj) out[@"state"] = stObj;
+            [self emitAsyncCallback:reqId payload:out];
+        } else if ([method isEqualToString:@"updateAntiBurnin"]) {
+            BOOL wantBi = args.count > 0 ? [args[0] boolValue] : YES;
+            NSInteger sec = args.count > 1 ? [args[1] integerValue] : 180;
+            MitaConfigStore *store = [MitaConfigStore shared];
+            store.antiBurninEnabled = wantBi;
+            store.antiBurninIntervalSec = MAX(60, MIN(1800, sec));
+            [store addEventLogKind:@"burnin" contact:@"防烧屏护屏" incoming:@"" detail:[NSString stringWithFormat:@"已%@防烧屏自动上下轻滑（每 %ld 秒）", wantBi ? @"开启" : @"关闭", (long)store.antiBurninIntervalSec] costMs:0];
+            NSString *pc = [store.pcSyncUrl stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            while ([pc hasSuffix:@"/"]) pc = [pc substringToIndex:pc.length - 1];
+            if (pc.length >= 8) {
+                NSURL *u = [NSURL URLWithString:[pc stringByAppendingString:@"/api/anti_burnin/config"]];
+                if (u) {
+                    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
+                    req.HTTPMethod = @"POST";
+                    req.timeoutInterval = 3.0;
+                    [req setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+                    NSDictionary *p = @{
+                        @"enabled": @(wantBi),
+                        @"interval_sec": @(store.antiBurninIntervalSec),
+                        @"ip": [MitaKeepAliveAndControl deviceLanIPv4] ?: @"",
+                        @"source": @"phone_app",
+                        @"sync_phone": @(NO)
+                    };
+                    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:p options:0 error:nil];
+                    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {}] resume];
+                }
+            }
+            NSMutableDictionary *out = [@{@"ok": @(YES), @"anti_burnin_enabled": @(wantBi), @"anti_burnin_interval_sec": @(store.antiBurninIntervalSec)} mutableCopy];
+            NSData *stData = [[self buildFullStateJsonString] dataUsingEncoding:NSUTF8StringEncoding];
+            id stObj = stData ? [NSJSONSerialization JSONObjectWithData:stData options:0 error:nil] : nil;
+            if (stObj) out[@"state"] = stObj;
+            [self emitAsyncCallback:reqId payload:out];
+        } else if ([method isEqualToString:@"triggerAntiBurninNow"]) {
+            MitaConfigStore *store = [MitaConfigStore shared];
+            NSString *pc = [store.pcSyncUrl stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            while ([pc hasSuffix:@"/"]) pc = [pc substringToIndex:pc.length - 1];
+            __block BOOL pcOk = NO;
+            if (pc.length >= 8) {
+                NSURL *u = [NSURL URLWithString:[pc stringByAppendingString:@"/api/anti_burnin/trigger"]];
+                if (u) {
+                    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
+                    req.HTTPMethod = @"POST";
+                    req.timeoutInterval = 4.5;
+                    [req setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+                    NSDictionary *p = @{@"ip": [MitaKeepAliveAndControl deviceLanIPv4] ?: @""};
+                    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:p options:0 error:nil];
+                    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+                        if (d.length > 0) {
+                            id jo = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+                            if ([jo isKindOfClass:[NSDictionary class]] && [jo[@"ok"] boolValue]) {
+                                pcOk = YES;
+                                if (jo[@"anti_burnin_count"]) store.antiBurninCount = [jo[@"anti_burnin_count"] integerValue];
+                                if (jo[@"last_burnin_at"]) store.lastBurninAt = [jo[@"last_burnin_at"] doubleValue];
+                            }
+                        }
+                        dispatch_semaphore_signal(sem);
+                    }] resume];
+                    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.8 * NSEC_PER_SEC)));
+                }
+            }
+            if (!pcOk) {
+                // 电脑离线时走本机回环轻缓上下滑动并归位兜底
+                [[MitaKeepAliveAndControl shared] executeActionBatch:@[
+                    @{@"action": @"swipe", @"x1": @(0.51), @"y1": @(0.66), @"x2": @(0.51), @"y2": @(0.44)},
+                    @{@"action": @"swipe", @"x1": @(0.51), @"y1": @(0.44), @"x2": @(0.51), @"y2": @(0.66)}
+                ]];
+                store.antiBurninCount = store.antiBurninCount + 1;
+                store.lastBurninAt = [[NSDate date] timeIntervalSince1970];
+            }
+            [store addEventLogKind:@"burnin" contact:@"防烧屏护屏" incoming:@"" detail:@"已完成一次手动温和上下滑动并归位" costMs:0];
+            NSMutableDictionary *out = [@{@"ok": @(YES), @"via_pc": @(pcOk)} mutableCopy];
+            NSData *stData = [[self buildFullStateJsonString] dataUsingEncoding:NSUTF8StringEncoding];
+            id stObj = stData ? [NSJSONSerialization JSONObjectWithData:stData options:0 error:nil] : nil;
+            if (stObj) out[@"state"] = stObj;
+            [self emitAsyncCallback:reqId payload:out];
+        } else if ([method isEqualToString:@"launchNativeApp"]) {
+            NSString *bid = args.count > 0 ? [args[0] description] : @"";
+            BOOL ok = [[MitaKeepAliveAndControl shared] launchAppByNameOrBundleId:bid];
+            [self emitAsyncCallback:reqId payload:@{@"ok": @(ok), @"bundle_id": bid ?: @""}];
+        } else if ([method isEqualToString:@"toggleAutoReply"]) {
             BOOL wantRun = args.count > 0 ? [args[0] boolValue] : YES;
             BOOL openWx = args.count > 1 ? [args[1] boolValue] : NO;
             NSDictionary *res = [[MitaAiGroupEngine shared] setAutoReplyRunning:wantRun launchWeChat:openWx triggerSource:@"app_button"];

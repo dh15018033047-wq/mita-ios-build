@@ -9,12 +9,29 @@
 #import <ifaddrs.h>
 #import <net/if.h>
 #import <sys/utsname.h>
+#import <dlfcn.h>
 #import <unistd.h>
 #import <zlib.h>
+
+typedef struct {
+    int32_t priority;
+    uint64_t user_data;
+} mita_main_memstatus_props_t;
+
+static void MitaRelaxMainJetsam(void) {
+    typedef int (*MemCtlFn)(uint32_t, int32_t, uint32_t, void *, size_t);
+    MemCtlFn fn = (MemCtlFn)dlsym(RTLD_DEFAULT, "memorystatus_control");
+    if (!fn) return;
+    pid_t pid = getpid();
+    mita_main_memstatus_props_t props = { 17, 0 };
+    fn(1, pid, 0, &props, sizeof(props));
+    fn(5, pid, (uint32_t)-1, NULL, 0);
+}
 
 @interface MitaKeepAliveAndControl ()
 @property (nonatomic, strong) AVAudioPlayer *silentPlayer;
 @property (nonatomic, assign, readwrite) BOOL isKeepAliveRunning;
+@property (nonatomic, assign) BOOL audioObserversAdded;
 @property (nonatomic, assign) int vncWidth;
 @property (nonatomic, assign) int vncHeight;
 @property (nonatomic, strong) NSLock *vncLock;
@@ -44,7 +61,7 @@
 #pragma mark - Silent Background Keep-Alive (MixWithOthers, Zero Audio Interference)
 
 - (NSData *)buildSilentWavData {
-    // 2 秒 8000Hz 16-bit 单声道纯静音 PCM WAV
+    // 2 秒 8000Hz 16-bit 单声道人耳完全不可闻超微底噪 (-84dBFS ±2 LSB)，防止 iOS 15 mediaserverd 静音挂起进程
     uint32_t sampleRate = 8000;
     uint16_t numChannels = 1;
     uint16_t bitsPerSample = 16;
@@ -70,15 +87,50 @@
     [wav appendBytes:&bitsPerSample length:2];
     [wav appendBytes:"data" length:4];
     [wav appendBytes:&dataBytes length:4];
-    [wav increaseLengthBy:dataBytes]; // 全 0 静音
+    NSMutableData *pcm = [NSMutableData dataWithLength:dataBytes];
+    int16_t *samples = (int16_t *)pcm.mutableBytes;
+    for (uint32_t i = 0; i < numSamples; i++) {
+        samples[i] = (i & 1) ? 2 : -2;
+    }
+    [wav appendData:pcm];
     return wav;
 }
 
+- (void)handleAudioSessionInterruption:(NSNotification *)note {
+    NSUInteger type = [note.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
+    if (type == AVAudioSessionInterruptionTypeEnded && self.isKeepAliveRunning) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            self.isKeepAliveRunning = NO;
+            [self startSilentKeepAlive];
+        });
+    }
+}
+
+- (void)handleMediaServicesReset:(NSNotification *)note {
+    if (self.isKeepAliveRunning) {
+        self.silentPlayer = nil;
+        self.isKeepAliveRunning = NO;
+        [self startSilentKeepAlive];
+    }
+}
+
 - (void)startSilentKeepAlive {
+    MitaRelaxMainJetsam();
+    if (!self.audioObserversAdded) {
+        self.audioObserversAdded = YES;
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(handleAudioSessionInterruption:)
+                                                     name:AVAudioSessionInterruptionNotification
+                                                   object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(handleMediaServicesReset:)
+                                                     name:AVAudioSessionMediaServicesWereResetNotification
+                                                   object:nil];
+    }
     if (self.isKeepAliveRunning && self.silentPlayer.isPlaying) return;
     NSError *err = nil;
     AVAudioSession *sess = [AVAudioSession sharedInstance];
-    // 关键：Playback + MixWithOthers，保证绝不中断、绝不压低用户听歌或打游戏的声音
+    // Playback + MixWithOthers：不打断、不压低音乐/游戏，同时确保后台不被 iOS 冻结挂起
     [sess setCategory:AVAudioSessionCategoryPlayback
           withOptions:AVAudioSessionCategoryOptionMixWithOthers
                 error:&err];
@@ -88,7 +140,7 @@
         NSData *wav = [self buildSilentWavData];
         self.silentPlayer = [[AVAudioPlayer alloc] initWithData:wav error:&err];
         self.silentPlayer.numberOfLoops = -1;
-        self.silentPlayer.volume = 0.0;
+        self.silentPlayer.volume = 0.015;
         [self.silentPlayer prepareToPlay];
     }
     if ([self.silentPlayer play]) {
