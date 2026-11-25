@@ -1,12 +1,12 @@
-name: Build MitaPhoneAgent iOS arm64
+name: Build MitaPhoneAgent iOS arm64 Fast
 on:
   push:
-    branches: [ main ]
+    branches: [ main, v510-fast ]
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: macos-15
+  build-m14:
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - name: Compile native arm64-apple-ios15.0 Mach-O binaries
@@ -39,13 +39,54 @@ jobs:
             -o MitaEdgeOverlay_arm64
 
           file MitaPhoneAgent_arm64 MitaEdgeOverlay_arm64
-          otool -L MitaPhoneAgent_arm64
-          otool -L MitaEdgeOverlay_arm64
           ls -lh MitaPhoneAgent_arm64 MitaEdgeOverlay_arm64
       - name: Upload Mach-O Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: mita-ios-arm64
+          name: mita-ios-arm64-m14
+          path: |
+            MitaPhoneAgent_arm64
+            MitaEdgeOverlay_arm64
+
+  build-intel:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile native arm64-apple-ios15.0 Mach-O binaries
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "Using iOS SDK: $SDK"
+          xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc -O2 -Wall \
+            -framework UIKit \
+            -framework Foundation \
+            -framework WebKit \
+            -framework AVFoundation \
+            -framework CoreGraphics \
+            -framework Vision \
+            -lz \
+            main.m AppDelegate.m MainViewController.m \
+            MitaConfigStore.m MitaKeepAliveAndControl.m \
+            MitaFloatingHudManager.m MitaAiGroupEngine.m MitaLanServer.m \
+            -o MitaPhoneAgent_arm64
+
+          xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc -O2 -Wall \
+            -framework UIKit \
+            -framework Foundation \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            MitaEdgeOverlayApp.m \
+            -o MitaEdgeOverlay_arm64
+
+          file MitaPhoneAgent_arm64 MitaEdgeOverlay_arm64
+          ls -lh MitaPhoneAgent_arm64 MitaEdgeOverlay_arm64
+      - name: Upload Mach-O Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mita-ios-arm64-intel
           path: |
             MitaPhoneAgent_arm64
             MitaEdgeOverlay_arm64
