@@ -1,4 +1,5 @@
 #import "MitaKeepAliveAndControl.h"
+#import "MitaConfigStore.h"
 #import "MitaFloatingHudManager.h"
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
@@ -115,6 +116,10 @@ static void MitaRelaxMainJetsam(void) {
 }
 
 - (void)startSilentKeepAlive {
+    if (![MitaConfigStore shared].remoteControlEnabled) {
+        [self stopSilentKeepAlive];
+        return;
+    }
     MitaRelaxMainJetsam();
     if (!self.audioObserversAdded) {
         self.audioObserversAdded = YES;
@@ -151,8 +156,12 @@ static void MitaRelaxMainJetsam(void) {
 - (void)stopSilentKeepAlive {
     if (self.silentPlayer) {
         [self.silentPlayer stop];
+        self.silentPlayer = nil;
     }
     self.isKeepAliveRunning = NO;
+    [[AVAudioSession sharedInstance] setActive:NO
+                                   withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+                                         error:nil];
 }
 
 #pragma mark - TrollStore Native App Launcher (LSApplicationWorkspace)

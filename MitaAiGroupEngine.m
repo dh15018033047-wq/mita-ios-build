@@ -1003,9 +1003,9 @@
 #pragma mark - Auto-Reply Master Runtime & Standalone Vision Patrol Engine
 
 - (void)bootstrapRuntimeIfNeeded {
-    [self ensurePatrolTimerStarted];
     MitaConfigStore *store = [MitaConfigStore shared];
-    if (store.botRunning) {
+    if (store.remoteControlEnabled && store.botRunning) {
+        [self ensurePatrolTimerStarted];
         [self setAutoReplyRunning:YES launchWeChat:NO triggerSource:@"bootstrap"];
     } else {
         [[MitaFloatingHudManager shared] updateWithRunning:NO
@@ -1014,6 +1014,13 @@
                                                      model:store.apiModel
                                               repliedCount:self.totalRepliedCount
                                                 statusLine:self.monitorStatusLine];
+    }
+}
+
+- (void)stopPatrolTimer {
+    if (self.patrolTimer) {
+        dispatch_source_cancel(self.patrolTimer);
+        self.patrolTimer = nil;
     }
 }
 
@@ -1081,12 +1088,20 @@
 - (NSDictionary *)setAutoReplyRunning:(BOOL)running
                          launchWeChat:(BOOL)launchWx
                         triggerSource:(NSString *)source {
-    [self ensurePatrolTimerStarted];
     MitaConfigStore *store = [MitaConfigStore shared];
+    if (running && !store.remoteControlEnabled) {
+        running = NO;
+    }
     store.botRunning = running;
     if (running) {
         store.botEnabled = YES;
+        [self ensurePatrolTimerStarted];
         [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
+    } else {
+        [self stopPatrolTimer];
+        if (!store.remoteControlEnabled || !store.keepAliveEnabled) {
+            [[MitaKeepAliveAndControl shared] stopSilentKeepAlive];
+        }
     }
 
     [self.guardLock lock];
@@ -1114,7 +1129,7 @@
                      lastContact:self.monitorLastContact ?: @""
                       statusLine:@"已停止自动回复，点击主按钮可随时重新启动"
                     repliedCount:self.totalRepliedCount];
-        if (![source isEqualToString:@"pc_remote"]) {
+        if (![source isEqualToString:@"pc_remote"] && store.remoteControlEnabled) {
             [self notifyLocalOverlayControlMode:@"idle"];
         }
     }

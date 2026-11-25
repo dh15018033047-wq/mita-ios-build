@@ -68,7 +68,22 @@
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self acceptLoop];
     });
-    [self startHeartbeatLoop];
+    if ([MitaConfigStore shared].remoteControlEnabled) {
+        [self startHeartbeatLoop];
+    }
+}
+
+- (void)pauseBackgroundHeartbeat {
+    if (self.heartbeatTimer) {
+        dispatch_source_cancel(self.heartbeatTimer);
+        self.heartbeatTimer = nil;
+    }
+}
+
+- (void)resumeBackgroundHeartbeat {
+    if ([MitaConfigStore shared].remoteControlEnabled) {
+        [self startHeartbeatLoop];
+    }
 }
 
 - (void)stop {
@@ -79,10 +94,7 @@
         shutdown(fd, SHUT_RDWR);
         close(fd);
     }
-    if (self.heartbeatTimer) {
-        dispatch_source_cancel(self.heartbeatTimer);
-        self.heartbeatTimer = nil;
-    }
+    [self pauseBackgroundHeartbeat];
 }
 
 - (NSDictionary *)buildPingPayload {
@@ -92,7 +104,7 @@
         @"platform": @"ios",
         @"app": @"MitaPhoneAgent",
         @"app_title": @"米塔 手机智能体 (巨魔版)",
-        @"version": @"5.1.0",
+        @"version": @"5.2.0",
         @"model": [MitaKeepAliveAndControl deviceModelName],
         @"ios_version": self.cachedIosVersion ?: @"15.8.2",
         @"width": @(self.cachedWidth > 0 ? self.cachedWidth : 1242),
@@ -122,6 +134,7 @@
 
 - (void)startHeartbeatLoop {
     if (self.heartbeatTimer) return;
+    if (![MitaConfigStore shared].remoteControlEnabled) return;
     dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0);
     self.heartbeatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
     dispatch_source_set_timer(self.heartbeatTimer, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), 12 * NSEC_PER_SEC, 2 * NSEC_PER_SEC);
@@ -133,6 +146,10 @@
 }
 
 - (void)sendHeartbeatOnce {
+    if (![MitaConfigStore shared].remoteControlEnabled) {
+        [self pauseBackgroundHeartbeat];
+        return;
+    }
     NSString *pc = [MitaConfigStore shared].pcSyncUrl;
     while ([pc hasSuffix:@"/"]) pc = [pc substringToIndex:pc.length - 1];
     if (pc.length < 8) return;
@@ -318,14 +335,19 @@
             BOOL wantRc = dict[@"remote_control_enabled"] != nil ? [dict[@"remote_control_enabled"] boolValue] : [dict[@"enabled"] boolValue];
             store.remoteControlEnabled = wantRc;
             if (wantRc) {
-                [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
+                if (store.keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning) {
+                    [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
+                }
+                [self resumeBackgroundHeartbeat];
                 [[MitaFloatingHudManager shared] ensureOverlayDaemonLaunched];
                 [[MitaFloatingHudManager shared] syncPlaybackState];
             } else {
-                if ([MitaAiGroupEngine shared].isAutoReplyRunning) {
+                if ([MitaAiGroupEngine shared].isAutoReplyRunning || store.botRunning) {
                     [[MitaAiGroupEngine shared] setAutoReplyRunning:NO launchWeChat:NO triggerSource:@"remote_off"];
                 }
                 [[MitaFloatingHudManager shared] stopFloatingWindow];
+                [[MitaKeepAliveAndControl shared] stopSilentKeepAlive];
+                [self pauseBackgroundHeartbeat];
             }
         }
         if (dict[@"anti_burnin_enabled"] != nil) store.antiBurninEnabled = [dict[@"anti_burnin_enabled"] boolValue];
@@ -346,7 +368,7 @@
         }
         NSArray *batch = [act[@"actions"] isKindOfClass:[NSArray class]] ? act[@"actions"] : @[act];
         NSArray *steps = [[MitaKeepAliveAndControl shared] executeActionBatch:batch];
-        respObj = @{@"ok": @(YES), @"steps": steps, @"version": @"5.1.0"};
+        respObj = @{@"ok": @(YES), @"steps": steps, @"version": @"5.2.0"};
     } else if ([path isEqualToString:@"/edge_pulse"]) {
         id inObj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : @{};
         NSDictionary *dict = [inObj isKindOfClass:[NSDictionary class]] ? inObj : @{};

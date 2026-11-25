@@ -625,17 +625,9 @@ typedef NS_ENUM(NSInteger, MitaControlMode) {
     self.dotView = [[UIView alloc] initWithFrame:CGRectMake(12, 14, 8, 8)];
     self.dotView.layer.cornerRadius = 4.0;
     self.dotView.backgroundColor = [UIColor colorWithRed:0.20 green:0.90 blue:0.58 alpha:1.0];
+    self.dotView.alpha = 1.0;
     self.dotView.userInteractionEnabled = NO;
     [self.pillBox addSubview:self.dotView];
-
-    CABasicAnimation *pulse = [CABasicAnimation animationWithKeyPath:@"opacity"];
-    pulse.fromValue = @(0.45);
-    pulse.toValue = @(1.0);
-    pulse.duration = 1.05;
-    pulse.autoreverses = YES;
-    pulse.repeatCount = HUGE_VALF;
-    pulse.removedOnCompletion = NO;
-    [self.dotView.layer addAnimation:pulse forKey:@"mitaTakeDotPulse"];
 
     self.statusLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     self.statusLabel.font = [UIFont systemFontOfSize:12.4 weight:UIFontWeightSemibold];
@@ -956,6 +948,7 @@ static CGImageRef MitaCreateSdfEdgeMaskImage(CGSize size, CGFloat cornerRadius, 
     self.statusDotView = [[UIView alloc] initWithFrame:CGRectMake(6.5, 5.5, 5.0, 5.0)];
     self.statusDotView.backgroundColor = [UIColor colorWithRed:0.12 green:0.88 blue:1.00 alpha:1.0];
     self.statusDotView.layer.cornerRadius = 2.5;
+    self.statusDotView.alpha = 1.0;
     [self.statusPillView addSubview:self.statusDotView];
 
     self.statusPillLabel = [[UILabel alloc] initWithFrame:CGRectZero];
@@ -965,23 +958,28 @@ static CGImageRef MitaCreateSdfEdgeMaskImage(CGSize size, CGFloat cornerRadius, 
     [self.statusPillView addSubview:self.statusPillLabel];
 
     [self addSubview:self.statusPillView];
+}
 
-    CABasicAnimation *dotPulse = [CABasicAnimation animationWithKeyPath:@"opacity"];
-    dotPulse.fromValue = @(0.42);
-    dotPulse.toValue = @(1.0);
-    dotPulse.duration = 1.2;
-    dotPulse.autoreverses = YES;
-    dotPulse.repeatCount = HUGE_VALF;
-    dotPulse.removedOnCompletion = NO;
-    [self.statusDotView.layer addAnimation:dotPulse forKey:@"mitaDotPulse"];
-
+- (void)ensurePillTimerRunning {
+    if (self.pillTimer != nil) return;
     __weak typeof(self) weakSelf = self;
-    self.pillTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(self.pillTimer, dispatch_time(DISPATCH_TIME_NOW, 0), (uint64_t)(1.0 * NSEC_PER_SEC), (uint64_t)(0.15 * NSEC_PER_SEC));
-    dispatch_source_set_event_handler(self.pillTimer, ^{
+    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(t,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                              (uint64_t)(1.0 * NSEC_PER_SEC),
+                              (uint64_t)(0.20 * NSEC_PER_SEC));
+    dispatch_source_set_event_handler(t, ^{
         [weakSelf updateStatusPillText];
     });
-    dispatch_resume(self.pillTimer);
+    self.pillTimer = t;
+    dispatch_resume(t);
+}
+
+- (void)stopPillTimer {
+    if (self.pillTimer != nil) {
+        dispatch_source_cancel(self.pillTimer);
+        self.pillTimer = nil;
+    }
 }
 
 - (void)updateStatusPillText {
@@ -1132,8 +1130,7 @@ static CGImageRef MitaCreateSdfEdgeMaskImage(CGSize size, CGFloat cornerRadius, 
 
     [CATransaction commit];
     [self bringSubviewToFront:self.statusPillView];
-    [self updateStatusPillText];
-    [self ensureGpuAnimationsRunning];
+    [self syncGpuOpacityAndMode];
 }
 
 - (void)ensureGpuAnimationsRunning {
@@ -1177,6 +1174,11 @@ static CGImageRef MitaCreateSdfEdgeMaskImage(CGSize size, CGFloat cornerRadius, 
 
 - (void)syncGpuOpacityAndMode {
     CGFloat targetOp = MAX(0.0f, MIN(1.0f, self.masterOpacity));
+    if (self.activeControl && targetOp > 0.05f) {
+        [self ensurePillTimerRunning];
+    } else {
+        [self stopPillTimer];
+    }
     if (targetOp > 0.005f) {
         [self ensureGpuAnimationsRunning];
     } else if (self.gpuAnimRunning) {
@@ -1192,7 +1194,9 @@ static CGImageRef MitaCreateSdfEdgeMaskImage(CGSize size, CGFloat cornerRadius, 
     self.layer.opacity = (float)targetOp;
     self.cometConicLayer.opacity = lively ? 0.96f : 0.82f;
     [CATransaction commit];
-    [self updateStatusPillText];
+    if (self.activeControl && targetOp > 0.01f) {
+        [self updateStatusPillText];
+    }
 }
 
 @end
@@ -1324,9 +1328,9 @@ static NSString *MitaControlModeName(MitaControlMode m) {
 
     self.pollSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     dispatch_source_set_timer(self.pollSource,
-                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
-                              (uint64_t)(0.40 * NSEC_PER_SEC),
-                              (uint64_t)(0.08 * NSEC_PER_SEC));
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                              (uint64_t)(6.0 * NSEC_PER_SEC),
+                              (uint64_t)(0.50 * NSEC_PER_SEC));
     dispatch_source_set_event_handler(self.pollSource, ^{
         [weakSelf onPollTick];
     });
@@ -1604,7 +1608,7 @@ static NSString *MitaControlModeName(MitaControlMode m) {
         }
         self.view.hidden = YES;
         [self destroyShieldWindowIfNeeded];
-        if ((now - self.lastWindowReassertTs) >= 5.0) {
+        if ((now - self.lastWindowReassertTs) >= 15.0) {
             self.lastWindowReassertTs = now;
             [self writeDiagnosticsSnapshot];
         }
@@ -1614,8 +1618,8 @@ static NSString *MitaControlModeName(MitaControlMode m) {
     [self syncShieldWindowGeometryAnimated:NO];
     [self.cursorView checkAutoFadeIfIdle];
 
-    // 每 5 秒自动校验并重申顶层窗口可见性，锁屏解锁或桌面切换后 100% 自动恢复显示
-    if ((now - self.lastWindowReassertTs) >= 5.0) {
+    // 每 15 秒自动校验并重申顶层窗口可见性，锁屏解锁或桌面切换后 100% 自动恢复显示
+    if ((now - self.lastWindowReassertTs) >= 15.0) {
         self.lastWindowReassertTs = now;
         if (!self.screenLocked && self.reassertWindowBlock) {
             self.reassertWindowBlock();
@@ -1930,7 +1934,7 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
     return @{
         @"ok": @(YES),
         @"daemon": @"MitaEdgeOverlay",
-        @"version": @"5.1.0",
+        @"version": @"5.2.0",
         @"port": @(19081),
         @"overlay_master_visible": @(self.overlayMasterVisible),
         @"control_mode": modeOut,
@@ -1961,7 +1965,7 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
     NSDictionary *diag = @{
         @"pid": @(getpid()),
         @"uid": @(getuid()),
-        @"version": @"5.1.0",
+        @"version": @"5.2.0",
         @"context_id": @(self.hostedContextId),
         @"overlay_master_visible": @(self.overlayMasterVisible),
         @"takeover_bar_visible": @(barVis),
@@ -2277,7 +2281,7 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
     NSData *bodyData = (take > 0) ? [buf subdataWithRange:NSMakeRange(hdrEnd.location + 4, take)] : [NSData data];
 
     if ([path isEqualToString:@"/ping"] || [path isEqualToString:@"/status"]) {
-        __block NSDictionary *stOut = @{@"ok": @(YES), @"daemon": @"MitaEdgeOverlay", @"version": @"5.1.0", @"port": @(19081)};
+        __block NSDictionary *stOut = @{@"ok": @(YES), @"daemon": @"MitaEdgeOverlay", @"version": @"5.2.0", @"port": @(19081)};
         MitaEdgeRootViewController *strongVC = weakVC;
         if (strongVC) {
             dispatch_sync(dispatch_get_main_queue(), ^{
@@ -2300,7 +2304,7 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
                     [strongVC handleAiCursorTapRawX:rx rawY:ry passthroughMs:pMs lockAi:lockAi];
                 });
             }
-            MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_cursor_tap", @"x": @(rx), @"y": @(ry), @"version": @"5.1.0"});
+            MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_cursor_tap", @"x": @(rx), @"y": @(ry), @"version": @"5.2.0"});
         } else if ([actType isEqualToString:@"ai_cursor_swipe"] || [actType isEqualToString:@"cursor_swipe"]) {
             double x1 = [dict[@"x1"] doubleValue];
             double y1 = [dict[@"y1"] doubleValue];
@@ -2314,7 +2318,7 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
                     [strongVC handleAiCursorSwipeFromX:x1 y:y1 toX:x2 y:y2 duration:dur lockAi:lockAi];
                 });
             }
-            MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_cursor_swipe", @"version": @"5.1.0"});
+            MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_cursor_swipe", @"version": @"5.2.0"});
         } else if ([actType isEqualToString:@"ai_thinking"] || [actType isEqualToString:@"thinking"]) {
             BOOL active = dict[@"active"] ? [dict[@"active"] boolValue] : YES;
             NSString *txt = [dict[@"text"] isKindOfClass:[NSString class]] ? dict[@"text"] : @"思考中";
@@ -2328,7 +2332,7 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
                     [strongVC handleAiThinking:active text:txt rawX:rx rawY:ry hasPoint:hasPt lockAi:lockAi];
                 });
             }
-            MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_thinking", @"active": @(active), @"version": @"5.1.0"});
+            MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_thinking", @"active": @(active), @"version": @"5.2.0"});
         } else if ([actType isEqualToString:@"set_control_mode"] || [actType isEqualToString:@"takeover"]) {
             NSString *mStr = [[dict[@"mode"] ?: @"human_control" description] lowercaseString];
             BOOL hasRemoteKey = (dict[@"remote_enabled"] != nil && dict[@"remote_enabled"] != [NSNull null]);
@@ -2361,7 +2365,7 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
                         [strongVC applyOverlayMasterOffAndHideAll];
                     });
                 }
-                MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_control_mode", @"control_mode": @"off", @"version": @"5.1.0"});
+                MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_control_mode", @"control_mode": @"off", @"version": @"5.2.0"});
             } else {
                 MitaControlMode mode = MitaControlModeHumanControl;
                 if ([mStr isEqualToString:@"ai_locked"] || [mStr isEqualToString:@"ai"] || [mStr isEqualToString:@"locked"]) {
@@ -2392,7 +2396,7 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
                         [strongVC applyControlModeFromExternal:mode ttlSec:ttlSec pcUrl:pcUrl];
                     });
                 }
-                MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_control_mode", @"control_mode": MitaControlModeName(mode), @"version": @"5.1.0"});
+                MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_control_mode", @"control_mode": MitaControlModeName(mode), @"version": @"5.2.0"});
             }
         } else if ([actType isEqualToString:@"passthrough"]) {
             double pMs = dict[@"ms"] ? [dict[@"ms"] doubleValue] : (dict[@"passthrough_ms"] ? [dict[@"passthrough_ms"] doubleValue] : 600.0);
@@ -2402,7 +2406,7 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
                     [strongVC openPassthroughGateMs:pMs];
                 });
             }
-            MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_passthrough", @"ms": @(pMs), @"version": @"5.1.0"});
+            MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_passthrough", @"ms": @(pMs), @"version": @"5.2.0"});
         } else if ([actType isEqualToString:@"launch_app"] || [actType isEqualToString:@"open_app"]) {
             NSString *bid = [dict[@"bundle_id"] ?: dict[@"app"] ?: @"" description];
             __block BOOL opened = NO;
@@ -2419,14 +2423,14 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
                     }
                 } @catch (NSException *ex) {}
             }
-            MitaEdgeSendHttp(fd, 200, @{@"ok": @(opened), @"channel": @"edge_19081_lsworkspace", @"bundle_id": bid ?: @"", @"steps": @[@{@"ok": @(opened)}], @"version": @"5.1.0"});
+            MitaEdgeSendHttp(fd, 200, @{@"ok": @(opened), @"channel": @"edge_19081_lsworkspace", @"bundle_id": bid ?: @"", @"steps": @[@{@"ok": @(opened)}], @"version": @"5.2.0"});
         } else {
             NSString *txt = MitaEdgeExtractCopyText(dict);
             if (txt.length > 0) {
                 dispatch_sync(dispatch_get_main_queue(), ^{
                     [UIPasteboard generalPasteboard].string = txt;
                 });
-                MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081", @"len": @(txt.length), @"version": @"5.1.0"});
+                MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081", @"len": @(txt.length), @"version": @"5.2.0"});
             } else {
                 MitaEdgeSendHttp(fd, 200, @{@"ok": @(NO), @"error": @"empty_text"});
             }
@@ -2472,7 +2476,7 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
         dispatch_async(dispatch_get_main_queue(), ^{
             [weakVC reloadControlStateNow];
         });
-        MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_pulse", @"version": @"5.1.0"});
+        MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_pulse", @"version": @"5.2.0"});
     } else {
         MitaEdgeSendHttp(fd, 404, @{@"ok": @(NO), @"error": @"not_found"});
     }

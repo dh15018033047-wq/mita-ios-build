@@ -15,10 +15,15 @@
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     MitaConfigStore *store = [MitaConfigStore shared];
-    if (store.remoteControlEnabled || store.keepAliveEnabled || store.botRunning) {
+    if (store.remoteControlEnabled && (store.keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning || store.botRunning)) {
         [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
+    } else {
+        [[MitaKeepAliveAndControl shared] stopSilentKeepAlive];
     }
     [[MitaLanServer shared] startOnPort:19080];
+    if (!store.remoteControlEnabled) {
+        [[MitaLanServer shared] pauseBackgroundHeartbeat];
+    }
 
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     self.rootVC = [[MainViewController alloc] init];
@@ -26,35 +31,48 @@
     [self.window makeKeyAndVisible];
 
     // 同步全局远程控制边缘流光状态（不再绑死微信自动回复！）
-    [[MitaFloatingHudManager shared] syncPlaybackState];
-    // 仅当远程总控与微信模块均开启时，恢复微信自动回复模块守护
     if (store.remoteControlEnabled) {
+        [[MitaFloatingHudManager shared] syncPlaybackState];
         [[MitaAiGroupEngine shared] bootstrapRuntimeIfNeeded];
+    } else {
+        [[MitaFloatingHudManager shared] stopFloatingWindow];
     }
     return YES;
 }
 
 - (void)applicationDidBecomeActive:(UIApplication *)application {
     MitaConfigStore *store = [MitaConfigStore shared];
-    if (store.remoteControlEnabled || store.keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning) {
+    if (store.remoteControlEnabled && (store.keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning)) {
         [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
+    } else {
+        [[MitaKeepAliveAndControl shared] stopSilentKeepAlive];
     }
     [[MitaLanServer shared] restartListenerIfNeeded];
-    [[MitaFloatingHudManager shared] syncPlaybackState];
+    if (store.remoteControlEnabled) {
+        [[MitaLanServer shared] resumeBackgroundHeartbeat];
+        [[MitaFloatingHudManager shared] syncPlaybackState];
+    } else {
+        [[MitaLanServer shared] pauseBackgroundHeartbeat];
+    }
     [self.rootVC notifyHostResume];
 }
 
 - (void)applicationWillResignActive:(UIApplication *)application {
     MitaConfigStore *store = [MitaConfigStore shared];
-    if ((store.remoteControlEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning) && store.floatingHudEnabled) {
+    if (store.remoteControlEnabled && store.floatingHudEnabled) {
         [[MitaFloatingHudManager shared] syncPlaybackState];
+    }
+    if (!store.remoteControlEnabled) {
+        [[MitaKeepAliveAndControl shared] stopSilentKeepAlive];
     }
 }
 
 - (void)applicationDidEnterBackground:(UIApplication *)application {
     MitaConfigStore *store = [MitaConfigStore shared];
-    if (store.remoteControlEnabled || store.keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning) {
+    if (store.remoteControlEnabled && (store.keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning)) {
         [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
+    } else {
+        [[MitaKeepAliveAndControl shared] stopSilentKeepAlive];
     }
 }
 

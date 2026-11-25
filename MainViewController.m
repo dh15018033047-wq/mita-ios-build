@@ -102,7 +102,7 @@
     NSMutableDictionary *d = [[store toDictionaryRedactingKey:YES] mutableCopy];
     NSString *ip = [MitaKeepAliveAndControl deviceLanIPv4];
     d[@"platform"] = @"ios";
-    d[@"version"] = @"5.1.0";
+    d[@"version"] = @"5.2.0";
     d[@"device_ip"] = ip;
     d[@"lan_endpoint"] = [NSString stringWithFormat:@"http://%@:%d", ip, [MitaLanServer shared].listenPort];
     d[@"device_model"] = [MitaKeepAliveAndControl deviceModelName];
@@ -156,18 +156,24 @@ completionHandler:(void (^)(NSString * _Nullable))completionHandler {
             NSData *ad = [arg dataUsingEncoding:NSUTF8StringEncoding];
             NSDictionary *patch = ad ? [NSJSONSerialization JSONObjectWithData:ad options:0 error:nil] : nil;
             if ([patch isKindOfClass:[NSDictionary class]]) {
-                [[MitaConfigStore shared] updateFromDictionary:patch];
-                if ([MitaConfigStore shared].remoteControlEnabled || [MitaConfigStore shared].keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning) {
+                MitaConfigStore *store = [MitaConfigStore shared];
+                [store updateFromDictionary:patch];
+                if (store.remoteControlEnabled && (store.keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning)) {
                     [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
                 } else {
                     [[MitaKeepAliveAndControl shared] stopSilentKeepAlive];
                 }
                 if (patch[@"floating_hud_enabled"] != nil || patch[@"remote_control_enabled"] != nil) {
-                    if (![MitaConfigStore shared].floatingHudEnabled || ![MitaConfigStore shared].remoteControlEnabled) {
+                    if (!store.floatingHudEnabled || !store.remoteControlEnabled) {
                         [[MitaFloatingHudManager shared] stopFloatingWindow];
                     } else {
                         [[MitaFloatingHudManager shared] ensureOverlayDaemonLaunched];
                         [[MitaFloatingHudManager shared] syncPlaybackState];
+                    }
+                    if (!store.remoteControlEnabled) {
+                        [[MitaLanServer shared] pauseBackgroundHeartbeat];
+                    } else {
+                        [[MitaLanServer shared] resumeBackgroundHeartbeat];
                     }
                 }
                 [[MitaAiGroupEngine shared] pushConfigToPcQuietly];
@@ -238,17 +244,22 @@ completionHandler:(void (^)(NSString * _Nullable))completionHandler {
             MitaConfigStore *store = [MitaConfigStore shared];
             store.remoteControlEnabled = wantRc;
             if (wantRc) {
-                [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
+                if (store.keepAliveEnabled || [MitaAiGroupEngine shared].isAutoReplyRunning) {
+                    [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
+                }
                 [[MitaLanServer shared] restartListenerIfNeeded];
+                [[MitaLanServer shared] resumeBackgroundHeartbeat];
                 [[MitaFloatingHudManager shared] ensureOverlayDaemonLaunched];
                 [[MitaFloatingHudManager shared] syncPlaybackState];
                 [store addEventLogKind:@"remote" contact:@"远程总控" incoming:@"" detail:@"已开启全局远程控制（电脑操控/防烧屏/边缘流光就绪，无需开微信）" costMs:0];
             } else {
-                if ([MitaAiGroupEngine shared].isAutoReplyRunning) {
+                if ([MitaAiGroupEngine shared].isAutoReplyRunning || store.botRunning) {
                     [[MitaAiGroupEngine shared] setAutoReplyRunning:NO launchWeChat:NO triggerSource:@"remote_master_off"];
                 }
                 [[MitaFloatingHudManager shared] stopFloatingWindow];
-                [store addEventLogKind:@"remote" contact:@"远程总控" incoming:@"" detail:@"已关闭全局远程控制（后台零触控干预）" costMs:0];
+                [[MitaKeepAliveAndControl shared] stopSilentKeepAlive];
+                [[MitaLanServer shared] pauseBackgroundHeartbeat];
+                [store addEventLogKind:@"remote" contact:@"远程总控" incoming:@"" detail:@"已关闭全局远程控制（零悬浮框、零保活、零后台唤醒）" costMs:0];
             }
             // 双向同步到电脑端 /api/remote_control/toggle
             NSString *pc = [store.pcSyncUrl stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];

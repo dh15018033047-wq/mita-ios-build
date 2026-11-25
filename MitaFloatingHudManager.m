@@ -38,6 +38,7 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
 @property (nonatomic, copy) NSString *curStatusLine;
 @property (nonatomic, strong) dispatch_source_t keepSyncSource;
 - (void)ensureKeepSyncTimerStarted;
+- (void)stopKeepSyncTimer;
 @end
 
 @implementation MitaFloatingHudManager
@@ -61,7 +62,9 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
         _curModel = @"gemini-4-neon-xhigh";
         _curRepliedCount = 0;
         _curStatusLine = @"点击「立即启动」开启全局屏幕边缘蓝色波浪控制";
-        [self ensureKeepSyncTimerStarted];
+        if ([MitaConfigStore shared].remoteControlEnabled && [MitaConfigStore shared].floatingHudEnabled) {
+            [self ensureKeepSyncTimerStarted];
+        }
     }
     return self;
 }
@@ -114,7 +117,11 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
 }
 
 - (BOOL)ensureOverlayDaemonLaunched {
-    if (![MitaConfigStore shared].floatingHudEnabled || ![MitaConfigStore shared].remoteControlEnabled) return NO;
+    if (![MitaConfigStore shared].floatingHudEnabled || ![MitaConfigStore shared].remoteControlEnabled) {
+        [self stopKeepSyncTimer];
+        return NO;
+    }
+    [self ensureKeepSyncTimerStarted];
     if ([self isDaemonAlive]) return YES;
 
     NSString *binPath = [self helperBinaryPath];
@@ -157,6 +164,13 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
 
 - (void)terminateOverlayDaemon {
     notify_post(MITA_NOTIFY_EDGE_EXIT);
+    NSString *pidStr = [NSString stringWithContentsOfFile:[self pidFilePath] encoding:NSUTF8StringEncoding error:nil];
+    if (pidStr.length > 0) {
+        pid_t targetPid = (pid_t)[pidStr intValue];
+        if (targetPid > 1 && targetPid != getpid()) {
+            kill(targetPid, SIGTERM);
+        }
+    }
     NSString *binPath = [self helperBinaryPath];
     if (![[NSFileManager defaultManager] fileExistsAtPath:binPath]) return;
 
@@ -209,7 +223,10 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
     }
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     if (edgeEn && remoteOn) {
+        [self ensureKeepSyncTimerStarted];
         [self ensureOverlayDaemonLaunched];
+    } else {
+        [self stopKeepSyncTimer];
     }
 
     NSDictionary *payload = @{
@@ -233,7 +250,21 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
     notify_post(MITA_NOTIFY_EDGE_CHANGED);
 }
 
+- (void)stopKeepSyncTimer {
+    [self.stateLock lock];
+    dispatch_source_t src = self.keepSyncSource;
+    self.keepSyncSource = nil;
+    [self.stateLock unlock];
+    if (src != nil) {
+        dispatch_source_cancel(src);
+    }
+}
+
 - (void)ensureKeepSyncTimerStarted {
+    if (![MitaConfigStore shared].remoteControlEnabled || ![MitaConfigStore shared].floatingHudEnabled) {
+        [self stopKeepSyncTimer];
+        return;
+    }
     [self.stateLock lock];
     if (self.keepSyncSource != nil) {
         [self.stateLock unlock];
@@ -255,13 +286,14 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
 }
 
 - (void)attachToHostView:(UIView *)hostView {
-    [self ensureKeepSyncTimerStarted];
-    // 仅在悬浮层与远程总控同时开启时预热守护进程；若远程总控关闭则确保守护进程停止
+    // 仅在悬浮层与远程总控同时开启时启动同步定时器并预热守护进程；若远程总控关闭则销毁定时器并确保守护进程停止
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         if ([MitaConfigStore shared].floatingHudEnabled && [MitaConfigStore shared].remoteControlEnabled) {
+            [self ensureKeepSyncTimerStarted];
             [self ensureOverlayDaemonLaunched];
             [self writeAndNotifyEdgeState];
         } else {
+            [self stopKeepSyncTimer];
             [self stopFloatingWindow];
         }
     });
@@ -271,6 +303,7 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
     BOOL hudOn = [MitaConfigStore shared].floatingHudEnabled;
     BOOL remoteOn = [MitaConfigStore shared].remoteControlEnabled;
     if (!hudOn || !remoteOn) {
+        [self stopKeepSyncTimer];
         if ([self isDaemonAlive]) {
             [self stopFloatingWindow];
         }
@@ -345,8 +378,16 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
 }
 
 - (BOOL)startFloatingWindow {
-    [MitaConfigStore shared].floatingHudEnabled = YES;
-    [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
+    MitaConfigStore *store = [MitaConfigStore shared];
+    store.floatingHudEnabled = YES;
+    if (!store.remoteControlEnabled) {
+        [self stopKeepSyncTimer];
+        return NO;
+    }
+    if (store.keepAliveEnabled || self.curRunning) {
+        [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
+    }
+    [self ensureKeepSyncTimerStarted];
     BOOL ok = [self ensureOverlayDaemonLaunched];
     // 点亮一次 5 秒蓝色波浪预览脉冲（若已在控制运行中则常驻流淌）
     [self triggerControlPulseSeconds:5.0 phase:(self.curRunning ? self.curPhase : @"controlling")];
@@ -358,26 +399,32 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
     _pulseUntilTs = 0.0;
     [self.stateLock unlock];
 
+    if (![MitaConfigStore shared].floatingHudEnabled || ![MitaConfigStore shared].remoteControlEnabled) {
+        [self stopKeepSyncTimer];
+    }
+
     // 1. 先向本机 :19081/action 短超时 POST 立即隐藏悬浮胶囊与释放窗口
-    NSURL *u = [NSURL URLWithString:@"http://127.0.0.1:19081/action"];
-    if (u) {
-        NSDictionary *offPayload = @{
-            @"action": @"set_control_mode",
-            @"mode": @"off",
-            @"remote_enabled": @(NO)
-        };
-        NSData *body = [NSJSONSerialization dataWithJSONObject:offPayload options:0 error:nil];
-        if (body) {
-            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-            NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
-            req.HTTPMethod = @"POST";
-            req.timeoutInterval = 0.30;
-            [req setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
-            req.HTTPBody = body;
-            [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-                dispatch_semaphore_signal(sem);
-            }] resume];
-            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)));
+    if ([self isDaemonAlive]) {
+        NSURL *u = [NSURL URLWithString:@"http://127.0.0.1:19081/action"];
+        if (u) {
+            NSDictionary *offPayload = @{
+                @"action": @"set_control_mode",
+                @"mode": @"off",
+                @"remote_enabled": @(NO)
+            };
+            NSData *body = [NSJSONSerialization dataWithJSONObject:offPayload options:0 error:nil];
+            if (body) {
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
+                req.HTTPMethod = @"POST";
+                req.timeoutInterval = 0.30;
+                [req setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+                req.HTTPBody = body;
+                [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+                    dispatch_semaphore_signal(sem);
+                }] resume];
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)));
+            }
         }
     }
 
