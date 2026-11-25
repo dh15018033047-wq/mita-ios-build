@@ -19,6 +19,7 @@ NS_ASSUME_NONNULL_BEGIN
                statusLine:(NSString *)statusLine;
 
 - (void)triggerControlPulseSeconds:(NSTimeInterval)seconds phase:(NSString *)phase;
+- (BOOL)ensureOverlayDaemonLaunched;
 - (void)syncPlaybackState;
 - (BOOL)startFloatingWindow;
 - (void)stopFloatingWindow;
