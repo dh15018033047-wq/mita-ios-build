@@ -119,7 +119,7 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
     id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
     if (![obj isKindOfClass:[NSDictionary class]]) return NO;
     NSString *ver = [obj[@"version"] isKindOfClass:[NSString class]] ? obj[@"version"] : @"";
-    return [ver isEqualToString:@"5.3.0"];
+    return [ver isEqualToString:@"5.4.0"];
 }
 
 - (BOOL)isActive {

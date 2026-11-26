@@ -679,48 +679,49 @@ typedef NS_ENUM(NSInteger, MitaControlMode) {
     self.pillBox.hidden = NO;
     self.pillBox.alpha = 1.0;
 
-    // v5.3.0：AiLocked 与 HumanControl 100% 共享完全一致的 208x36 尺寸与屏幕严格正中间中心点，使用 bounds + center 与 transform 缩放解耦！
-    CGFloat pw = 208.0, ph = 36.0;
+    // v5.4.0：大号易按 + 严格正居中：AiLocked 与 HumanControl 100% 共享完全一致的 244x46 尺寸与正中间中心点，右侧主按钮 106x34，bounds + center 与 transform 解耦
+    CGFloat pw = 244.0, ph = 46.0;
     CGFloat centerX = round(W * 0.5);
-    CGFloat centerY = round(H - bottomSafe - 56.0 - ph * 0.5);
+    CGFloat centerY = round(H - bottomSafe - 58.0 - ph * 0.5);
     self.pillBox.bounds = CGRectMake(0.0, 0.0, pw, ph);
     self.pillBox.center = CGPointMake(centerX, centerY);
     self.pillBox.layer.cornerRadius = ph * 0.5;
 
-    self.dotView.frame = CGRectMake(13.0, (ph - 8.0) * 0.5, 8.0, 8.0);
-    self.statusLabel.frame = CGRectMake(27.0, 0.0, 86.0, ph);
-    self.actionButton.frame = CGRectMake(pw - 86.0 - 5.0, (ph - 26.0) * 0.5, 86.0, 26.0);
-    self.actionButton.layer.cornerRadius = 13.0;
-    self.actionButton.titleLabel.font = [UIFont systemFontOfSize:12.0 weight:UIFontWeightBold];
+    self.dotView.frame = CGRectMake(16.0, (ph - 9.0) * 0.5, 9.0, 9.0);
+    self.dotView.layer.cornerRadius = 4.5;
+    self.statusLabel.frame = CGRectMake(32.0, 0.0, 96.0, ph);
+    self.actionButton.frame = CGRectMake(pw - 106.0 - 6.0, (ph - 34.0) * 0.5, 106.0, 34.0);
+    self.actionButton.layer.cornerRadius = 17.0;
+    self.actionButton.titleLabel.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightBold];
 
     if (self.controlMode == MitaControlModeAiLocked) {
         self.pillBox.backgroundColor = [UIColor colorWithRed:0.06 green:0.08 blue:0.14 alpha:0.96];
-        self.pillBox.layer.borderColor = [UIColor colorWithRed:0.28 green:0.80 blue:1.00 alpha:0.78].CGColor;
+        self.pillBox.layer.borderColor = [UIColor colorWithRed:0.28 green:0.80 blue:1.00 alpha:0.82].CGColor;
         self.dotView.backgroundColor = [UIColor colorWithRed:0.16 green:0.86 blue:0.98 alpha:1.0];
 
         self.statusLabel.text = @"AI 控制中";
-        self.statusLabel.font = [UIFont systemFontOfSize:12.4 weight:UIFontWeightSemibold];
-        self.statusLabel.textColor = [UIColor colorWithRed:0.93 green:0.97 blue:1.00 alpha:0.98];
+        self.statusLabel.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightSemibold];
+        self.statusLabel.textColor = [UIColor colorWithRed:0.94 green:0.98 blue:1.00 alpha:0.99];
 
         self.actionButton.backgroundColor = [UIColor whiteColor];
         [self.actionButton setTitle:@"我来接管" forState:UIControlStateNormal];
         [self.actionButton setTitleColor:[UIColor colorWithRed:0.06 green:0.09 blue:0.17 alpha:1.0] forState:UIControlStateNormal];
     } else {
         self.pillBox.backgroundColor = [UIColor colorWithRed:0.05 green:0.12 blue:0.15 alpha:0.95];
-        self.pillBox.layer.borderColor = [UIColor colorWithRed:0.18 green:0.86 blue:0.58 alpha:0.85].CGColor;
+        self.pillBox.layer.borderColor = [UIColor colorWithRed:0.18 green:0.86 blue:0.58 alpha:0.88].CGColor;
         self.dotView.backgroundColor = [UIColor colorWithRed:0.20 green:0.90 blue:0.58 alpha:1.0];
 
         self.statusLabel.text = @"我来控制";
-        self.statusLabel.font = [UIFont systemFontOfSize:12.4 weight:UIFontWeightSemibold];
-        self.statusLabel.textColor = [UIColor colorWithRed:0.92 green:1.00 blue:0.96 alpha:0.98];
+        self.statusLabel.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightSemibold];
+        self.statusLabel.textColor = [UIColor colorWithRed:0.93 green:1.00 blue:0.97 alpha:0.99];
 
         self.actionButton.backgroundColor = [UIColor colorWithRed:0.06 green:0.74 blue:0.52 alpha:1.0];
         [self.actionButton setTitle:@"交回 AI" forState:UIControlStateNormal];
         [self.actionButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     }
 
-    self.hintToastLabel.bounds = CGRectMake(0.0, 0.0, 252.0, 26.0);
-    self.hintToastLabel.center = CGPointMake(centerX, centerY - ph * 0.5 - 23.0);
+    self.hintToastLabel.bounds = CGRectMake(0.0, 0.0, 260.0, 28.0);
+    self.hintToastLabel.center = CGPointMake(centerX, centerY - ph * 0.5 - 24.0);
 }
 
 - (void)layoutSubviews {
@@ -792,7 +793,7 @@ typedef NS_ENUM(NSInteger, MitaControlMode) {
                                     btnInPill.size.width,
                                     btnInPill.size.height);
     CGRect r = targetView ? [self convertRect:baseBtnRect toView:targetView] : baseBtnRect;
-    return CGRectInset(r, -2.0, -4.0);
+    return CGRectInset(r, -6.0, -8.0);
 }
 
 - (CGRect)interactiveHitRectInView:(UIView *)targetView {
@@ -1422,7 +1423,7 @@ static NSString *MitaControlModeName(MitaControlMode m) {
 
 - (BOOL)tryAcquireActionDebounceLock {
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if ((now - self.lastTouchHandledTs) < 0.28) {
+    if ((now - self.lastTouchHandledTs) < 0.42) {
         return NO;
     }
     self.lastTouchHandledTs = now;
@@ -1492,34 +1493,55 @@ static NSString *MitaControlModeName(MitaControlMode m) {
 
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     BOOL gateOpen = (self.passthroughUntilTs > now);
-    BOOL needShield = (!self.screenLocked && self.controlMode == MitaControlModeAiLocked && !gateOpen);
 
-    // HumanControl / 锁屏 / AI 瞬时穿窗期：立即彻底销毁 shieldWindow = nil 并注销 ContextID，真机手指 100% 原生自由触控！
-    if (!needShield) {
+    // 锁屏 / AI 瞬时穿窗期：销毁拦截窗确保解锁与 AI 点击 100% 畅通
+    if (self.screenLocked || gateOpen) {
         [self destroyShieldWindowIfNeeded];
         return;
     }
 
-    // 仅在 MitaControlModeAiLocked 下按需创建并注册全屏护盾窗
+    // v5.4.0 几何隔离防穿透拦截窗：
+    // - AiLocked：全屏 sb (414x736) 防误触护盾；
+    // - HumanControl：仅包裹大号悬浮胶囊外扩 4pt 的迷你局部拦截窗 (252x54)，点胶囊 0% 穿透底层服务号/聊天，屏幕其余 95.5% 100% 原生自由触控！
+    BOOL isAiLocked = (self.controlMode == MitaControlModeAiLocked);
+    CGRect pillBase = self.takeoverBar ? [self.takeoverBar basePillRect] : CGRectMake(round(W * 0.5) - 122.0, H - 116.0, 244.0, 46.0);
+    CGRect localPillShield = CGRectInset(pillBase, -4.0, -4.0);
+    CGRect targetFrame = isAiLocked ? sb : localPillShield;
+
+    // 几何尺寸发生切换（全屏 <-> 迷你胶囊）时，先彻底注销旧 CAContext 再以精确新尺寸重建，100% 杜绝 WindowServer 残留旧命中盒！
+    if (self.shieldWindow && !CGRectEqualToRect(self.shieldWindow.frame, targetFrame)) {
+        [self destroyShieldWindowIfNeeded];
+    }
+
     BOOL newlyCreated = NO;
     if (!self.shieldWindow) {
         MitaShieldViewController *svc = [[MitaShieldViewController alloc] init];
-        MitaShieldWindow *sw = [[MitaShieldWindow alloc] initWithFrame:sb];
+        MitaShieldWindow *sw = [[MitaShieldWindow alloc] initWithFrame:targetFrame];
         sw.edgeRootVC = self;
         sw.backgroundColor = [UIColor clearColor];
         sw.opaque = NO;
-        sw.clipsToBounds = NO;
+        sw.clipsToBounds = YES;
+        sw.layer.cornerRadius = isAiLocked ? 0.0 : (targetFrame.size.height * 0.5);
         sw.userInteractionEnabled = YES;
         sw.rootViewController = svc;
         sw.windowLevel = 10000012.0;
 
-        MitaTouchShieldView *tsv = [[MitaTouchShieldView alloc] initWithFrame:svc.view.bounds];
+        svc.view.frame = sw.bounds;
+        svc.view.backgroundColor = [UIColor clearColor];
+        svc.view.clipsToBounds = YES;
+
+        MitaTouchShieldView *tsv = [[MitaTouchShieldView alloc] initWithFrame:sw.bounds];
         tsv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        tsv.backgroundColor = [UIColor clearColor];
+        // alpha=0.01 肉眼 100% 透明不可见，但确保 backboardd 跨进程命中测试将其视为实体拦截面，100% 物理吞掉触摸绝不穿透到底层微信！
+        tsv.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.01];
+        tsv.layer.cornerRadius = isAiLocked ? 0.0 : (targetFrame.size.height * 0.5);
+        tsv.clipsToBounds = YES;
         tsv.userInteractionEnabled = YES;
         __weak typeof(self) weakSelf = self;
         tsv.onBlockedTouch = ^{
-            [weakSelf flashBlockedHintThrottled];
+            if (weakSelf && weakSelf.controlMode == MitaControlModeAiLocked) {
+                [weakSelf flashBlockedHintThrottled];
+            }
         };
         [svc.view addSubview:tsv];
         self.touchShieldView = tsv;
@@ -1529,14 +1551,14 @@ static NSString *MitaControlModeName(MitaControlMode m) {
         newlyCreated = YES;
     } else {
         self.shieldWindow.windowLevel = 10000012.0;
-        if (!CGRectEqualToRect(self.shieldWindow.frame, sb)) {
-            self.shieldWindow.frame = sb;
-        }
+        self.shieldWindow.clipsToBounds = YES;
+        self.shieldWindow.layer.cornerRadius = isAiLocked ? 0.0 : (targetFrame.size.height * 0.5);
         UIView *sRoot = self.shieldWindow.rootViewController.view;
         sRoot.hidden = NO;
         sRoot.frame = self.shieldWindow.bounds;
         if (self.touchShieldView) {
             self.touchShieldView.frame = self.shieldWindow.bounds;
+            self.touchShieldView.layer.cornerRadius = isAiLocked ? 0.0 : (targetFrame.size.height * 0.5);
             self.touchShieldView.hidden = NO;
             self.touchShieldView.userInteractionEnabled = YES;
         }
@@ -1820,13 +1842,13 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
 - (void)handleTakeoverBarButtonTappedFromMode:(MitaControlMode)curMode {
     if (self.controlMode != curMode) return;
     if (curMode == MitaControlModeAiLocked) {
-        // 点击「我来接管」-> 0ms 立即切换为常驻 HumanControl，彻底置 nil 销毁 shieldWindow 释放全屏触摸，并暂停电脑与本机自动控制
+        // 点击「我来接管」-> 0ms 立即切换为常驻 HumanControl，将 shieldWindow 重建为仅覆盖胶囊的迷你局部防穿透窗，释放屏幕其余 95.5% 区域自由触摸
         [self.cursorView hideCursorAnimated:YES];
         self.controlMode = MitaControlModeHumanControl;
         self.controlModeString = @"human_control";
         self.aiLockExpireAtTs = 0;
         [self.takeoverBar applyControlMode:MitaControlModeHumanControl animated:YES];
-        [self destroyShieldWindowIfNeeded];
+        [self syncShieldWindowGeometryAnimated:NO];
         self.waveView.activeControl = NO;
         self.waveView.activeReplying = NO;
         self.waveView.phaseLabel = @"我来控制";
@@ -1948,7 +1970,7 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
     return @{
         @"ok": @(YES),
         @"daemon": @"MitaEdgeOverlay",
-        @"version": @"5.3.0",
+        @"version": @"5.4.0",
         @"port": @(19081),
         @"overlay_master_visible": @(self.overlayMasterVisible),
         @"control_mode": modeOut,
@@ -1979,7 +2001,7 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
     NSDictionary *diag = @{
         @"pid": @(getpid()),
         @"uid": @(getuid()),
-        @"version": @"5.3.0",
+        @"version": @"5.4.0",
         @"context_id": @(self.hostedContextId),
         @"overlay_master_visible": @(self.overlayMasterVisible),
         @"takeover_bar_visible": @(barVis),
@@ -2193,21 +2215,18 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
     MitaEdgeRootViewController *vc = self.edgeRootVC;
-    if (!vc || vc.screenLocked || self.hidden) return NO;
+    if (!vc || vc.screenLocked || self.hidden || !vc.overlayMasterVisible) return NO;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     if (vc.passthroughUntilTs > now) return NO;
-    if (vc.controlMode == MitaControlModeAiLocked) {
-        return CGRectContainsPoint(self.bounds, point);
-    }
-    return NO;
+    return CGRectContainsPoint(self.bounds, point);
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     MitaEdgeRootViewController *vc = self.edgeRootVC;
-    if (!vc || vc.screenLocked || self.hidden) return nil;
+    if (!vc || vc.screenLocked || self.hidden || !vc.overlayMasterVisible) return nil;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     if (vc.passthroughUntilTs > now) return nil;
-    if (vc.controlMode == MitaControlModeAiLocked) {
+    if (CGRectContainsPoint(self.bounds, point)) {
         return vc.touchShieldView;
     }
     return nil;
@@ -2216,11 +2235,12 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
 - (void)sendEvent:(UIEvent *)event {
     if (event.type == UIEventTypeTouches) {
         MitaEdgeRootViewController *vc = self.edgeRootVC;
-        if (vc && !vc.screenLocked && !self.hidden && vc.controlMode == MitaControlModeAiLocked) {
+        if (vc && !vc.screenLocked && !self.hidden && vc.overlayMasterVisible) {
             for (UITouch *t in [event allTouches]) {
                 if (t.phase == UITouchPhaseBegan) {
-                    CGPoint ptInRoot = [t locationInView:vc.view];
-                    [vc handleOverlayTouchDownAtPoint:ptInRoot];
+                    CGPoint locInWin = [t locationInView:self];
+                    CGPoint ptInScreen = CGPointMake(self.frame.origin.x + locInWin.x, self.frame.origin.y + locInWin.y);
+                    [vc handleOverlayTouchDownAtPoint:ptInScreen];
                     break;
                 }
             }
@@ -2295,7 +2315,7 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
     NSData *bodyData = (take > 0) ? [buf subdataWithRange:NSMakeRange(hdrEnd.location + 4, take)] : [NSData data];
 
     if ([path isEqualToString:@"/ping"] || [path isEqualToString:@"/status"]) {
-        __block NSDictionary *stOut = @{@"ok": @(YES), @"daemon": @"MitaEdgeOverlay", @"version": @"5.3.0", @"port": @(19081)};
+        __block NSDictionary *stOut = @{@"ok": @(YES), @"daemon": @"MitaEdgeOverlay", @"version": @"5.4.0", @"port": @(19081)};
         MitaEdgeRootViewController *strongVC = weakVC;
         if (strongVC) {
             dispatch_sync(dispatch_get_main_queue(), ^{
@@ -2304,7 +2324,7 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
         }
         MitaEdgeSendHttp(fd, 200, stOut);
     } else if ([path isEqualToString:@"/exit"]) {
-        MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"exiting": @(YES), @"version": @"5.3.0"});
+        MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"exiting": @(YES), @"version": @"5.4.0"});
         close(fd);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_MSEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             if (gPidFilePath.length > 0) {
@@ -2519,9 +2539,6 @@ static void MitaStartEdgeDaemonHttpServer(MitaEdgeRootViewController * __weak we
             if (fd < 0) { sleep(2); continue; }
             int yes = 1;
             setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-#ifdef SO_REUSEPORT
-            setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
-#endif
             struct sockaddr_in addr;
             memset(&addr, 0, sizeof(addr));
             addr.sin_family = AF_INET;
@@ -2529,6 +2546,14 @@ static void MitaStartEdgeDaemonHttpServer(MitaEdgeRootViewController * __weak we
             addr.sin_addr.s_addr = INADDR_ANY;
             if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(fd, 24) != 0) {
                 close(fd);
+                // 若已有另一正常实例占住 19081 端口，自我安静退出杜绝双实例蓝边重影！
+                if (gPidFilePath.length > 0) {
+                    NSString *curPid = [NSString stringWithContentsOfFile:gPidFilePath encoding:NSUTF8StringEncoding error:nil];
+                    int ownerPid = [curPid intValue];
+                    if (ownerPid > 1 && ownerPid != getpid() && kill(ownerPid, 0) == 0) {
+                        exit(0);
+                    }
+                }
                 sleep(2);
                 continue;
             }
@@ -2651,7 +2676,7 @@ static void MitaStartEdgeDaemonHttpServer(MitaEdgeRootViewController * __weak we
     if (gCtx != 0) {
         self.rootVC.hostedContextId = gCtx;
     }
-    if (self.rootVC.shieldWindow && self.rootVC.controlMode == MitaControlModeAiLocked && !self.rootVC.screenLocked) {
+    if (self.rootVC.shieldWindow && self.rootVC.overlayMasterVisible && !self.rootVC.screenLocked) {
         self.rootVC.shieldWindow.windowLevel = 10000012.0;
         unsigned int sCtx = [self registerHostedWindow:self.rootVC.shieldWindow];
         if (sCtx != 0) {
