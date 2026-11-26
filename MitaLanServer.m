@@ -104,7 +104,7 @@
         @"platform": @"ios",
         @"app": @"MitaPhoneAgent",
         @"app_title": @"米塔 手机智能体 (巨魔版)",
-        @"version": @"5.4.0",
+        @"version": @"5.5.0",
         @"model": [MitaKeepAliveAndControl deviceModelName],
         @"ios_version": self.cachedIosVersion ?: @"15.8.2",
         @"width": @(self.cachedWidth > 0 ? self.cachedWidth : 1242),
@@ -368,7 +368,7 @@
         }
         NSArray *batch = [act[@"actions"] isKindOfClass:[NSArray class]] ? act[@"actions"] : @[act];
         NSArray *steps = [[MitaKeepAliveAndControl shared] executeActionBatch:batch];
-        respObj = @{@"ok": @(YES), @"steps": steps, @"version": @"5.4.0"};
+        respObj = @{@"ok": @(YES), @"steps": steps, @"version": @"5.5.0"};
     } else if ([path isEqualToString:@"/edge_pulse"]) {
         id inObj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : @{};
         NSDictionary *dict = [inObj isKindOfClass:[NSDictionary class]] ? inObj : @{};

@@ -119,7 +119,8 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
     id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
     if (![obj isKindOfClass:[NSDictionary class]]) return NO;
     NSString *ver = [obj[@"version"] isKindOfClass:[NSString class]] ? obj[@"version"] : @"";
-    return [ver isEqualToString:@"5.4.0"];
+    if (ver.length == 0) return NO;
+    return ([ver isEqualToString:@"5.5.0"] || [ver compare:@"5.5.0" options:NSNumericSearch] != NSOrderedAscending);
 }
 
 - (BOOL)isActive {
@@ -298,9 +299,9 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
     dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
     dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
     dispatch_source_set_timer(src,
-                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                              (uint64_t)(3.0 * NSEC_PER_SEC),
-                              (uint64_t)(0.2 * NSEC_PER_SEC));
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                              (uint64_t)(12.0 * NSEC_PER_SEC),
+                              (uint64_t)(1.0 * NSEC_PER_SEC));
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(src, ^{
         [weakSelf onHeartbeatRefresh];
