@@ -37,8 +37,10 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
 @property (nonatomic, assign) NSInteger curRepliedCount;
 @property (nonatomic, copy) NSString *curStatusLine;
 @property (nonatomic, strong) dispatch_source_t keepSyncSource;
+@property (nonatomic, assign) NSTimeInterval lastSpawnAttemptTs;
 - (void)ensureKeepSyncTimerStarted;
 - (void)stopKeepSyncTimer;
+- (BOOL)isDaemonVersionCurrent;
 @end
 
 @implementation MitaFloatingHudManager
@@ -111,6 +113,15 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
     return NO;
 }
 
+- (BOOL)isDaemonVersionCurrent {
+    NSData *d = [NSData dataWithContentsOfFile:[self diagFilePath]];
+    if (d.length == 0) return NO;
+    id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+    if (![obj isKindOfClass:[NSDictionary class]]) return NO;
+    NSString *ver = [obj[@"version"] isKindOfClass:[NSString class]] ? obj[@"version"] : @"";
+    return [ver isEqualToString:@"5.3.0"];
+}
+
 - (BOOL)isActive {
     BOOL remoteOn = [MitaConfigStore shared].remoteControlEnabled;
     return [MitaConfigStore shared].floatingHudEnabled && remoteOn && [self isDaemonAlive];
@@ -122,7 +133,21 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
         return NO;
     }
     [self ensureKeepSyncTimerStarted];
-    if ([self isDaemonAlive]) return YES;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if ([self isDaemonAlive]) {
+        if ([self isDaemonVersionCurrent] || (now - self.lastSpawnAttemptTs) < 4.0) {
+            return YES;
+        }
+        // 检测到旧版 MitaEdgeOverlay 残留进程：先发 /exit 请求，再继续拉起新版 5.3.0 守护完成 Root 级清退接管
+        NSURL *exitUrl = [NSURL URLWithString:@"http://127.0.0.1:19081/exit"];
+        if (exitUrl) {
+            NSMutableURLRequest *exitReq = [NSMutableURLRequest requestWithURL:exitUrl];
+            exitReq.HTTPMethod = @"POST";
+            exitReq.timeoutInterval = 0.25;
+            [[[NSURLSession sharedSession] dataTaskWithRequest:exitReq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {}] resume];
+        }
+    }
+    self.lastSpawnAttemptTs = now;
 
     NSString *binPath = [self helperBinaryPath];
     if (![[NSFileManager defaultManager] fileExistsAtPath:binPath]) {
@@ -431,8 +456,15 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
     // 2. 写入最新 mita_edge_state.json 并广播
     [self writeAndNotifyEdgeState];
 
-    // 3. 只要关闭了悬浮框或关闭了远程总控，立即彻底终止 :19081 守护进程！
+    // 3. 只要关闭了悬浮框或关闭了远程总控，立即异步请求 :19081/exit 并彻底终止守护进程！
     if (![MitaConfigStore shared].floatingHudEnabled || ![MitaConfigStore shared].remoteControlEnabled) {
+        NSURL *exitUrl = [NSURL URLWithString:@"http://127.0.0.1:19081/exit"];
+        if (exitUrl) {
+            NSMutableURLRequest *exitReq = [NSMutableURLRequest requestWithURL:exitUrl];
+            exitReq.HTTPMethod = @"POST";
+            exitReq.timeoutInterval = 0.50;
+            [[[NSURLSession sharedSession] dataTaskWithRequest:exitReq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {}] resume];
+        }
         [self terminateOverlayDaemon];
     }
 }

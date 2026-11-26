@@ -575,6 +575,7 @@ typedef NS_ENUM(NSInteger, MitaControlMode) {
 - (void)applyControlMode:(MitaControlMode)mode animated:(BOOL)animated;
 - (void)playTapBounceFeedback;
 - (void)flashBlockedTouchHint;
+- (CGRect)basePillRect;
 - (CGRect)pillHitRectInView:(UIView *)targetView;
 - (CGRect)actionButtonHitRectInView:(UIView *)targetView;
 - (CGRect)interactiveHitRectInView:(UIView *)targetView;
@@ -602,7 +603,7 @@ typedef NS_ENUM(NSInteger, MitaControlMode) {
     self.hintToastLabel.textColor = [UIColor colorWithRed:0.94 green:0.97 blue:1.00 alpha:0.98];
     self.hintToastLabel.font = [UIFont systemFontOfSize:11.2 weight:UIFontWeightMedium];
     self.hintToastLabel.textAlignment = NSTextAlignmentCenter;
-    self.hintToastLabel.layer.cornerRadius = 12.0;
+    self.hintToastLabel.layer.cornerRadius = 13.0;
     self.hintToastLabel.clipsToBounds = YES;
     self.hintToastLabel.alpha = 0.0;
     self.hintToastLabel.userInteractionEnabled = NO;
@@ -622,7 +623,7 @@ typedef NS_ENUM(NSInteger, MitaControlMode) {
     self.pillBox.userInteractionEnabled = NO;
     [self addSubview:self.pillBox];
 
-    self.dotView = [[UIView alloc] initWithFrame:CGRectMake(12, 14, 8, 8)];
+    self.dotView = [[UIView alloc] initWithFrame:CGRectMake(13.0, 14.0, 8.0, 8.0)];
     self.dotView.layer.cornerRadius = 4.0;
     self.dotView.backgroundColor = [UIColor colorWithRed:0.20 green:0.90 blue:0.58 alpha:1.0];
     self.dotView.alpha = 1.0;
@@ -632,6 +633,7 @@ typedef NS_ENUM(NSInteger, MitaControlMode) {
     self.statusLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     self.statusLabel.font = [UIFont systemFontOfSize:12.4 weight:UIFontWeightSemibold];
     self.statusLabel.textColor = [UIColor colorWithRed:0.92 green:1.00 blue:0.96 alpha:0.98];
+    self.statusLabel.textAlignment = NSTextAlignmentLeft;
     self.statusLabel.userInteractionEnabled = NO;
     [self.pillBox addSubview:self.statusLabel];
 
@@ -662,11 +664,14 @@ typedef NS_ENUM(NSInteger, MitaControlMode) {
         self.pillBox.hidden = YES;
         return;
     }
-    CGFloat W = self.bounds.size.width;
-    CGFloat H = self.bounds.size.height;
-    if (W < 20.0 || H < 20.0) return;
     CGRect sb = [UIScreen mainScreen].bounds;
-    BOOL isModern = (sb.size.height / MAX(1.0, sb.size.width)) > 1.95;
+    if (sb.size.width < 20.0 || sb.size.height < 20.0) return;
+    if (!CGRectEqualToRect(self.frame, sb)) {
+        self.frame = sb;
+    }
+    CGFloat W = sb.size.width;
+    CGFloat H = sb.size.height;
+    BOOL isModern = (MAX(W, H) / MAX(1.0, MIN(W, H))) > 1.95;
     CGFloat bottomSafe = isModern ? 34.0 : 12.0;
 
     self.hidden = NO;
@@ -674,52 +679,48 @@ typedef NS_ENUM(NSInteger, MitaControlMode) {
     self.pillBox.hidden = NO;
     self.pillBox.alpha = 1.0;
 
-    // v5.1.0：AiLocked 与 HumanControl 统一为完全一致的尺寸与坐标 196x36，固定停靠右下安全区（0px 位移原地平滑切换）
-    CGFloat pw = 196.0, ph = 36.0;
-    self.pillBox.frame = CGRectMake(W - pw - 12.0, H - bottomSafe - ph - 58.0, pw, ph);
+    // v5.3.0：AiLocked 与 HumanControl 100% 共享完全一致的 208x36 尺寸与屏幕严格正中间中心点，使用 bounds + center 与 transform 缩放解耦！
+    CGFloat pw = 208.0, ph = 36.0;
+    CGFloat centerX = round(W * 0.5);
+    CGFloat centerY = round(H - bottomSafe - 56.0 - ph * 0.5);
+    self.pillBox.bounds = CGRectMake(0.0, 0.0, pw, ph);
+    self.pillBox.center = CGPointMake(centerX, centerY);
     self.pillBox.layer.cornerRadius = ph * 0.5;
+
+    self.dotView.frame = CGRectMake(13.0, (ph - 8.0) * 0.5, 8.0, 8.0);
+    self.statusLabel.frame = CGRectMake(27.0, 0.0, 86.0, ph);
+    self.actionButton.frame = CGRectMake(pw - 86.0 - 5.0, (ph - 26.0) * 0.5, 86.0, 26.0);
+    self.actionButton.layer.cornerRadius = 13.0;
+    self.actionButton.titleLabel.font = [UIFont systemFontOfSize:12.0 weight:UIFontWeightBold];
 
     if (self.controlMode == MitaControlModeAiLocked) {
         self.pillBox.backgroundColor = [UIColor colorWithRed:0.06 green:0.08 blue:0.14 alpha:0.96];
         self.pillBox.layer.borderColor = [UIColor colorWithRed:0.28 green:0.80 blue:1.00 alpha:0.78].CGColor;
-
-        self.dotView.frame = CGRectMake(12.0, (ph - 8.0) * 0.5, 8.0, 8.0);
         self.dotView.backgroundColor = [UIColor colorWithRed:0.16 green:0.86 blue:0.98 alpha:1.0];
 
         self.statusLabel.text = @"AI 控制中";
         self.statusLabel.font = [UIFont systemFontOfSize:12.4 weight:UIFontWeightSemibold];
         self.statusLabel.textColor = [UIColor colorWithRed:0.93 green:0.97 blue:1.00 alpha:0.98];
-        self.statusLabel.frame = CGRectMake(25.0, 0, 82.0, ph);
 
-        self.actionButton.frame = CGRectMake(pw - 82.0, (ph - 26.0) * 0.5, 76.0, 26.0);
-        self.actionButton.layer.cornerRadius = 13.0;
         self.actionButton.backgroundColor = [UIColor whiteColor];
         [self.actionButton setTitle:@"我来接管" forState:UIControlStateNormal];
         [self.actionButton setTitleColor:[UIColor colorWithRed:0.06 green:0.09 blue:0.17 alpha:1.0] forState:UIControlStateNormal];
-        self.actionButton.titleLabel.font = [UIFont systemFontOfSize:12.0 weight:UIFontWeightBold];
     } else {
         self.pillBox.backgroundColor = [UIColor colorWithRed:0.05 green:0.12 blue:0.15 alpha:0.95];
         self.pillBox.layer.borderColor = [UIColor colorWithRed:0.18 green:0.86 blue:0.58 alpha:0.85].CGColor;
-
-        self.dotView.frame = CGRectMake(12.0, (ph - 8.0) * 0.5, 8.0, 8.0);
         self.dotView.backgroundColor = [UIColor colorWithRed:0.20 green:0.90 blue:0.58 alpha:1.0];
 
         self.statusLabel.text = @"我来控制";
         self.statusLabel.font = [UIFont systemFontOfSize:12.4 weight:UIFontWeightSemibold];
         self.statusLabel.textColor = [UIColor colorWithRed:0.92 green:1.00 blue:0.96 alpha:0.98];
-        self.statusLabel.frame = CGRectMake(25.0, 0, 82.0, ph);
 
-        self.actionButton.frame = CGRectMake(pw - 78.0, (ph - 26.0) * 0.5, 72.0, 26.0);
-        self.actionButton.layer.cornerRadius = 13.0;
         self.actionButton.backgroundColor = [UIColor colorWithRed:0.06 green:0.74 blue:0.52 alpha:1.0];
         [self.actionButton setTitle:@"交回 AI" forState:UIControlStateNormal];
         [self.actionButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        self.actionButton.titleLabel.font = [UIFont systemFontOfSize:12.0 weight:UIFontWeightBold];
     }
 
-    CGFloat hw = 252.0, hh = 26.0;
-    CGFloat hx = MIN(W - hw - 12.0, MAX(12.0, CGRectGetMidX(self.pillBox.frame) - hw * 0.5));
-    self.hintToastLabel.frame = CGRectMake(hx, CGRectGetMinY(self.pillBox.frame) - hh - 10.0, hw, hh);
+    self.hintToastLabel.bounds = CGRectMake(0.0, 0.0, 252.0, 26.0);
+    self.hintToastLabel.center = CGPointMake(centerX, centerY - ph * 0.5 - 23.0);
 }
 
 - (void)layoutSubviews {
@@ -770,15 +771,27 @@ typedef NS_ENUM(NSInteger, MitaControlMode) {
     });
 }
 
+- (CGRect)basePillRect {
+    if (CGRectIsEmpty(self.pillBox.bounds)) [self layoutForCurrentMode];
+    CGPoint c = self.pillBox.center;
+    CGSize sz = self.pillBox.bounds.size;
+    return CGRectMake(c.x - sz.width * 0.5, c.y - sz.height * 0.5, sz.width, sz.height);
+}
+
 - (CGRect)pillHitRectInView:(UIView *)targetView {
-    if (CGRectIsEmpty(self.pillBox.frame)) [self layoutForCurrentMode];
-    CGRect r = targetView ? [self convertRect:self.pillBox.frame toView:targetView] : self.pillBox.frame;
+    CGRect basePillRect = [self basePillRect];
+    CGRect r = targetView ? [self convertRect:basePillRect toView:targetView] : basePillRect;
     return CGRectInset(r, -10.0, -10.0);
 }
 
 - (CGRect)actionButtonHitRectInView:(UIView *)targetView {
-    if (CGRectIsEmpty(self.pillBox.frame)) [self layoutForCurrentMode];
-    CGRect r = targetView ? [self.pillBox convertRect:self.actionButton.frame toView:targetView] : self.actionButton.frame;
+    CGRect basePillRect = [self basePillRect];
+    CGRect btnInPill = self.actionButton.frame;
+    CGRect baseBtnRect = CGRectMake(basePillRect.origin.x + btnInPill.origin.x,
+                                    basePillRect.origin.y + btnInPill.origin.y,
+                                    btnInPill.size.width,
+                                    btnInPill.size.height);
+    CGRect r = targetView ? [self convertRect:baseBtnRect toView:targetView] : baseBtnRect;
     return CGRectInset(r, -2.0, -4.0);
 }
 
@@ -1338,6 +1351,7 @@ static NSString *MitaControlModeName(MitaControlMode m) {
 
     [self syncShieldWindowGeometryAnimated:NO];
     [self reloadControlStateNow];
+    [self writeDiagnosticsSnapshot];
 }
 
 - (void)applyOverlayMasterOffAndHideAll {
@@ -1928,13 +1942,13 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
 
 - (NSDictionary *)liveOverlayStatusDict {
     CGRect sf = self.shieldWindow ? self.shieldWindow.frame : CGRectZero;
-    CGRect pf = self.takeoverBar ? self.takeoverBar.pillBox.frame : CGRectZero;
+    CGRect pf = self.takeoverBar ? [self.takeoverBar basePillRect] : CGRectZero;
     BOOL barVis = (self.overlayMasterVisible && self.takeoverBar && !self.takeoverBar.hidden && !self.takeoverBar.pillBox.hidden && self.takeoverBar.pillBox.alpha >= 0.99);
     NSString *modeOut = (!self.overlayMasterVisible) ? @"off" : (self.controlModeString ?: @"human_control");
     return @{
         @"ok": @(YES),
         @"daemon": @"MitaEdgeOverlay",
-        @"version": @"5.2.0",
+        @"version": @"5.3.0",
         @"port": @(19081),
         @"overlay_master_visible": @(self.overlayMasterVisible),
         @"control_mode": modeOut,
@@ -1959,13 +1973,13 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
 - (void)writeDiagnosticsSnapshot {
     if (gDiagFilePath.length == 0) return;
     CGRect sf = self.shieldWindow ? self.shieldWindow.frame : CGRectZero;
-    CGRect pf = self.takeoverBar ? self.takeoverBar.pillBox.frame : CGRectZero;
+    CGRect pf = self.takeoverBar ? [self.takeoverBar basePillRect] : CGRectZero;
     BOOL barVis = (self.overlayMasterVisible && self.takeoverBar && !self.takeoverBar.hidden && !self.takeoverBar.pillBox.hidden && self.takeoverBar.pillBox.alpha >= 0.99);
     NSString *modeOut = (!self.overlayMasterVisible) ? @"off" : (self.controlModeString ?: @"human_control");
     NSDictionary *diag = @{
         @"pid": @(getpid()),
         @"uid": @(getuid()),
-        @"version": @"5.2.0",
+        @"version": @"5.3.0",
         @"context_id": @(self.hostedContextId),
         @"overlay_master_visible": @(self.overlayMasterVisible),
         @"takeover_bar_visible": @(barVis),
@@ -2281,7 +2295,7 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
     NSData *bodyData = (take > 0) ? [buf subdataWithRange:NSMakeRange(hdrEnd.location + 4, take)] : [NSData data];
 
     if ([path isEqualToString:@"/ping"] || [path isEqualToString:@"/status"]) {
-        __block NSDictionary *stOut = @{@"ok": @(YES), @"daemon": @"MitaEdgeOverlay", @"version": @"5.2.0", @"port": @(19081)};
+        __block NSDictionary *stOut = @{@"ok": @(YES), @"daemon": @"MitaEdgeOverlay", @"version": @"5.3.0", @"port": @(19081)};
         MitaEdgeRootViewController *strongVC = weakVC;
         if (strongVC) {
             dispatch_sync(dispatch_get_main_queue(), ^{
@@ -2289,6 +2303,19 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
             });
         }
         MitaEdgeSendHttp(fd, 200, stOut);
+    } else if ([path isEqualToString:@"/exit"]) {
+        MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"exiting": @(YES), @"version": @"5.3.0"});
+        close(fd);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_MSEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            if (gPidFilePath.length > 0) {
+                NSString *curPid = [NSString stringWithContentsOfFile:gPidFilePath encoding:NSUTF8StringEncoding error:nil];
+                if ([curPid intValue] == getpid()) {
+                    unlink([gPidFilePath UTF8String]);
+                }
+            }
+            exit(0);
+        });
+        return;
     } else if ([path isEqualToString:@"/action"] || [path isEqualToString:@"/copy_text"]) {
         id obj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : @{};
         NSDictionary *dict = [obj isKindOfClass:[NSDictionary class]] ? obj : @{};
