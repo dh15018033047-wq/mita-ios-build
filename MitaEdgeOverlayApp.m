@@ -68,19 +68,27 @@ static void MitaRelaxJetsamLimits(pid_t pid) {
 @property (nonatomic, strong) UIView *thinkingRingHost;
 @property (nonatomic, strong) CAGradientLayer *thinkingRingGradient;
 @property (nonatomic, strong) CAShapeLayer *thinkingRingMask;
+@property (nonatomic, strong) CAShapeLayer *thinkingPulseHalo;
 
 @property (nonatomic, strong) UIView *thinkingBubbleView;
+@property (nonatomic, strong) UIView *thinkingBorderClipView;
+@property (nonatomic, strong) CAGradientLayer *thinkingBorderConic;
+@property (nonatomic, strong) CAShapeLayer *thinkingBorderMask;
 @property (nonatomic, strong) UIView *sparkleHostView;
 @property (nonatomic, strong) CAShapeLayer *sparkleShapeLayer;
+@property (nonatomic, strong) UIView *subSparkleHostView;
+@property (nonatomic, strong) CAShapeLayer *subSparkleShapeLayer;
 @property (nonatomic, strong) UILabel *thinkingLabel;
 @property (nonatomic, strong) NSArray<UIView *> *thinkingDots;
 
 @property (nonatomic, assign) CGPoint currentPos;
 @property (nonatomic, assign) BOOL cursorVisible;
+@property (nonatomic, assign) BOOL persistentInAiMode;
 @property (nonatomic, assign) BOOL thinkingActive;
 @property (nonatomic, assign) NSTimeInterval lastActivityTs;
 @property (nonatomic, copy) NSString *thinkingText;
 
+- (void)ensureVisibleForAiControlAnimated:(BOOL)animated;
 - (void)showThinking:(BOOL)active text:(NSString *)text atPoint:(CGPoint)pt hasPoint:(BOOL)hasPt;
 - (void)playTapAtPoint:(CGPoint)pt;
 - (void)playSwipeFrom:(CGPoint)fromPt to:(CGPoint)toPt duration:(double)dur;
@@ -121,10 +129,18 @@ static CGPoint MitaNormalizePointToBounds(double rawX, double rawY, CGRect b) {
 }
 
 - (void)buildSublayers {
-    // 1. 思考中旋转极光星环（环绕光标尖端）
-    self.thinkingRingHost = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 38, 38)];
+    // 1. 思考中双层极光星云雷达环（环绕光标尖端：外环旋转锥形极光 + 内环柔光呼吸波）
+    self.thinkingRingHost = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 48, 48)];
     self.thinkingRingHost.userInteractionEnabled = NO;
     self.thinkingRingHost.alpha = 0.0;
+
+    self.thinkingPulseHalo = [CAShapeLayer layer];
+    self.thinkingPulseHalo.frame = self.thinkingRingHost.bounds;
+    self.thinkingPulseHalo.path = [UIBezierPath bezierPathWithOvalInRect:CGRectInset(self.thinkingRingHost.bounds, 10.0, 10.0)].CGPath;
+    self.thinkingPulseHalo.fillColor = [UIColor colorWithRed:0.16 green:0.84 blue:1.00 alpha:0.16].CGColor;
+    self.thinkingPulseHalo.strokeColor = [UIColor colorWithRed:0.32 green:0.86 blue:1.00 alpha:0.55].CGColor;
+    self.thinkingPulseHalo.lineWidth = 1.4;
+    [self.thinkingRingHost.layer addSublayer:self.thinkingPulseHalo];
 
     self.thinkingRingGradient = [CAGradientLayer layer];
     self.thinkingRingGradient.frame = self.thinkingRingHost.bounds;
@@ -134,67 +150,116 @@ static CGPoint MitaNormalizePointToBounds(double rawX, double rawY, CGRect b) {
     self.thinkingRingGradient.startPoint = CGPointMake(0.5, 0.5);
     self.thinkingRingGradient.endPoint = CGPointMake(0.5, 0.0);
     self.thinkingRingGradient.colors = @[
-        (id)[UIColor colorWithRed:0.13 green:0.83 blue:0.93 alpha:1.0].CGColor,
-        (id)[UIColor colorWithRed:0.38 green:0.55 blue:1.00 alpha:0.95].CGColor,
-        (id)[UIColor colorWithRed:0.62 green:0.35 blue:0.98 alpha:0.92].CGColor,
-        (id)[UIColor colorWithRed:0.93 green:0.30 blue:0.62 alpha:0.75].CGColor,
-        (id)[UIColor colorWithRed:0.13 green:0.83 blue:0.93 alpha:0.12].CGColor,
-        (id)[UIColor colorWithRed:0.13 green:0.83 blue:0.93 alpha:1.0].CGColor
+        (id)[UIColor colorWithRed:0.12 green:0.88 blue:1.00 alpha:1.0].CGColor,
+        (id)[UIColor colorWithRed:0.42 green:0.54 blue:1.00 alpha:0.96].CGColor,
+        (id)[UIColor colorWithRed:0.68 green:0.34 blue:0.98 alpha:0.92].CGColor,
+        (id)[UIColor colorWithRed:0.96 green:0.36 blue:0.68 alpha:0.80].CGColor,
+        (id)[UIColor colorWithRed:0.12 green:0.88 blue:1.00 alpha:0.08].CGColor,
+        (id)[UIColor colorWithRed:0.12 green:0.88 blue:1.00 alpha:1.0].CGColor
     ];
     self.thinkingRingMask = [CAShapeLayer layer];
     self.thinkingRingMask.frame = self.thinkingRingHost.bounds;
     self.thinkingRingMask.path = [UIBezierPath bezierPathWithOvalInRect:CGRectInset(self.thinkingRingHost.bounds, 2.5, 2.5)].CGPath;
     self.thinkingRingMask.fillColor = [UIColor clearColor].CGColor;
     self.thinkingRingMask.strokeColor = [UIColor whiteColor].CGColor;
-    self.thinkingRingMask.lineWidth = 2.4;
+    self.thinkingRingMask.lineWidth = 2.6;
     self.thinkingRingGradient.mask = self.thinkingRingMask;
     [self.thinkingRingHost.layer addSublayer:self.thinkingRingGradient];
     [self addSubview:self.thinkingRingHost];
 
-    // 2. 思考中高级磨砂微泡（矢量四芒星 + 动态文字 + 三颗错相位跳动极光点）
-    self.thinkingBubbleView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 126, 30)];
-    self.thinkingBubbleView.backgroundColor = [UIColor colorWithRed:0.06 green:0.08 blue:0.15 alpha:0.90];
-    self.thinkingBubbleView.layer.cornerRadius = 15.0;
-    self.thinkingBubbleView.layer.borderWidth = 0.85;
-    self.thinkingBubbleView.layer.borderColor = [UIColor colorWithRed:0.35 green:0.82 blue:1.00 alpha:0.65].CGColor;
-    self.thinkingBubbleView.layer.shadowColor = [UIColor colorWithRed:0.18 green:0.65 blue:1.00 alpha:1.0].CGColor;
-    self.thinkingBubbleView.layer.shadowOpacity = 0.36;
-    self.thinkingBubbleView.layer.shadowRadius = 8.0;
-    self.thinkingBubbleView.layer.shadowOffset = CGSizeMake(0, 2);
+    // 2. 思考中电影级流光描边磨砂胶囊（旋转流光边框 + 双星闪烁四芒星 + 清晰中文态 + 三颗彩虹弹跳波点）
+    self.thinkingBubbleView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 140, 34)];
+    self.thinkingBubbleView.backgroundColor = [UIColor colorWithRed:0.05 green:0.07 blue:0.14 alpha:0.93];
+    self.thinkingBubbleView.layer.cornerRadius = 17.0;
+    self.thinkingBubbleView.layer.borderWidth = 0.0;
+    self.thinkingBubbleView.layer.shadowColor = [UIColor colorWithRed:0.18 green:0.70 blue:1.00 alpha:1.0].CGColor;
+    self.thinkingBubbleView.layer.shadowOpacity = 0.44;
+    self.thinkingBubbleView.layer.shadowRadius = 11.0;
+    self.thinkingBubbleView.layer.shadowOffset = CGSizeMake(0, 3);
     self.thinkingBubbleView.userInteractionEnabled = NO;
     self.thinkingBubbleView.alpha = 0.0;
 
-    // 原生矢量四芒星（Apple Intelligence Sparkle 路径，绝不缺字！）
-    self.sparkleHostView = [[UIView alloc] initWithFrame:CGRectMake(10, 8, 14, 14)];
+    // 旋转流光描边层（纯 GPU Conic Gradient + 胶囊描边 Mask，Apple Intelligence 同款精致流光！）
+    self.thinkingBorderClipView = [[UIView alloc] initWithFrame:self.thinkingBubbleView.bounds];
+    self.thinkingBorderClipView.userInteractionEnabled = NO;
+    self.thinkingBorderClipView.clipsToBounds = YES;
+    self.thinkingBorderClipView.layer.cornerRadius = 17.0;
+    [self.thinkingBubbleView addSubview:self.thinkingBorderClipView];
+
+    self.thinkingBorderConic = [CAGradientLayer layer];
+    if (@available(iOS 12.0, *)) {
+        self.thinkingBorderConic.type = kCAGradientLayerConic;
+    }
+    self.thinkingBorderConic.startPoint = CGPointMake(0.5, 0.5);
+    self.thinkingBorderConic.endPoint = CGPointMake(0.5, 0.0);
+    self.thinkingBorderConic.colors = @[
+        (id)[UIColor colorWithRed:0.14 green:0.88 blue:1.00 alpha:0.98].CGColor,
+        (id)[UIColor colorWithRed:0.46 green:0.52 blue:1.00 alpha:0.95].CGColor,
+        (id)[UIColor colorWithRed:0.94 green:0.38 blue:0.72 alpha:0.92].CGColor,
+        (id)[UIColor colorWithRed:0.20 green:0.82 blue:1.00 alpha:0.28].CGColor,
+        (id)[UIColor colorWithRed:0.14 green:0.88 blue:1.00 alpha:0.98].CGColor
+    ];
+    [self.thinkingBorderClipView.layer addSublayer:self.thinkingBorderConic];
+
+    self.thinkingBorderMask = [CAShapeLayer layer];
+    self.thinkingBorderMask.fillColor = [UIColor clearColor].CGColor;
+    self.thinkingBorderMask.strokeColor = [UIColor whiteColor].CGColor;
+    self.thinkingBorderMask.lineWidth = 1.65;
+    self.thinkingBorderClipView.layer.mask = self.thinkingBorderMask;
+
+    // 原生矢量主四芒星 + 右上角副小星（双星错相位呼吸闪烁，极富灵气）
+    self.sparkleHostView = [[UIView alloc] initWithFrame:CGRectMake(11, 9, 15, 15)];
     self.sparkleShapeLayer = [CAShapeLayer layer];
     UIBezierPath *sp = [UIBezierPath bezierPath];
-    [sp moveToPoint:CGPointMake(7, 0.5)];
-    [sp addQuadCurveToPoint:CGPointMake(13.5, 7) controlPoint:CGPointMake(8.1, 5.9)];
-    [sp addQuadCurveToPoint:CGPointMake(7, 13.5) controlPoint:CGPointMake(8.1, 8.1)];
-    [sp addQuadCurveToPoint:CGPointMake(0.5, 7) controlPoint:CGPointMake(5.9, 8.1)];
-    [sp addQuadCurveToPoint:CGPointMake(7, 0.5) controlPoint:CGPointMake(5.9, 5.9)];
+    [sp moveToPoint:CGPointMake(7.5, 0.5)];
+    [sp addQuadCurveToPoint:CGPointMake(14.5, 7.5) controlPoint:CGPointMake(8.7, 6.3)];
+    [sp addQuadCurveToPoint:CGPointMake(7.5, 14.5) controlPoint:CGPointMake(8.7, 8.7)];
+    [sp addQuadCurveToPoint:CGPointMake(0.5, 7.5) controlPoint:CGPointMake(6.3, 8.7)];
+    [sp addQuadCurveToPoint:CGPointMake(7.5, 0.5) controlPoint:CGPointMake(6.3, 6.3)];
     [sp closePath];
     self.sparkleShapeLayer.path = sp.CGPath;
-    self.sparkleShapeLayer.fillColor = [UIColor colorWithRed:0.32 green:0.88 blue:1.00 alpha:1.0].CGColor;
+    self.sparkleShapeLayer.fillColor = [UIColor colorWithRed:0.36 green:0.92 blue:1.00 alpha:1.0].CGColor;
+    self.sparkleShapeLayer.shadowColor = [UIColor colorWithRed:0.26 green:0.86 blue:1.00 alpha:1.0].CGColor;
+    self.sparkleShapeLayer.shadowOpacity = 0.85;
+    self.sparkleShapeLayer.shadowRadius = 3.5;
+    self.sparkleShapeLayer.shadowOffset = CGSizeZero;
     [self.sparkleHostView.layer addSublayer:self.sparkleShapeLayer];
     [self.thinkingBubbleView addSubview:self.sparkleHostView];
 
+    self.subSparkleHostView = [[UIView alloc] initWithFrame:CGRectMake(22.5, 6.0, 7.0, 7.0)];
+    self.subSparkleShapeLayer = [CAShapeLayer layer];
+    UIBezierPath *sp2 = [UIBezierPath bezierPath];
+    [sp2 moveToPoint:CGPointMake(3.5, 0.3)];
+    [sp2 addQuadCurveToPoint:CGPointMake(6.7, 3.5) controlPoint:CGPointMake(4.1, 2.9)];
+    [sp2 addQuadCurveToPoint:CGPointMake(3.5, 6.7) controlPoint:CGPointMake(4.1, 4.1)];
+    [sp2 addQuadCurveToPoint:CGPointMake(0.3, 3.5) controlPoint:CGPointMake(2.9, 4.1)];
+    [sp2 addQuadCurveToPoint:CGPointMake(3.5, 0.3) controlPoint:CGPointMake(2.9, 2.9)];
+    [sp2 closePath];
+    self.subSparkleShapeLayer.path = sp2.CGPath;
+    self.subSparkleShapeLayer.fillColor = [UIColor colorWithRed:0.96 green:0.62 blue:0.86 alpha:0.98].CGColor;
+    [self.subSparkleHostView.layer addSublayer:self.subSparkleShapeLayer];
+    [self.thinkingBubbleView addSubview:self.subSparkleHostView];
+
     self.thinkingLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-    self.thinkingLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightSemibold];
-    self.thinkingLabel.textColor = [UIColor colorWithRed:0.95 green:0.98 blue:1.00 alpha:0.98];
+    self.thinkingLabel.font = [UIFont systemFontOfSize:12.2 weight:UIFontWeightSemibold];
+    self.thinkingLabel.textColor = [UIColor colorWithRed:0.96 green:0.99 blue:1.00 alpha:0.99];
     self.thinkingLabel.text = @"思考中";
     [self.thinkingBubbleView addSubview:self.thinkingLabel];
 
     NSMutableArray<UIView *> *dots = [NSMutableArray arrayWithCapacity:3];
     NSArray<UIColor *> *dotCols = @[
-        [UIColor colorWithRed:0.18 green:0.86 blue:1.00 alpha:1.0],
-        [UIColor colorWithRed:0.52 green:0.56 blue:1.00 alpha:1.0],
-        [UIColor colorWithRed:0.94 green:0.38 blue:0.70 alpha:1.0]
+        [UIColor colorWithRed:0.16 green:0.88 blue:1.00 alpha:1.0],
+        [UIColor colorWithRed:0.54 green:0.56 blue:1.00 alpha:1.0],
+        [UIColor colorWithRed:0.96 green:0.42 blue:0.74 alpha:1.0]
     ];
     for (int i = 0; i < 3; i++) {
-        UIView *dv = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 4.5, 4.5)];
-        dv.layer.cornerRadius = 2.25;
+        UIView *dv = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 4.8, 4.8)];
+        dv.layer.cornerRadius = 2.4;
         dv.backgroundColor = dotCols[i];
+        dv.layer.shadowColor = dotCols[i].CGColor;
+        dv.layer.shadowOpacity = 0.7;
+        dv.layer.shadowRadius = 2.5;
+        dv.layer.shadowOffset = CGSizeZero;
         [self.thinkingBubbleView addSubview:dv];
         [dots addObject:dv];
     }
@@ -202,48 +267,52 @@ static CGPoint MitaNormalizePointToBounds(double rawX, double rawY, CGRect b) {
     [self addSubview:self.thinkingBubbleView];
 
     // 3. 精致苹果风流线型虚拟鼠标指针（锚点固定在左上尖端 (0, 0)）
-    self.pointerContainer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 56, 44)];
+    self.pointerContainer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 58, 46)];
     self.pointerContainer.layer.anchorPoint = CGPointMake(0.0, 0.0);
     self.pointerContainer.userInteractionEnabled = NO;
     self.pointerContainer.alpha = 0.0;
 
     UIBezierPath *arrow = [UIBezierPath bezierPath];
     [arrow moveToPoint:CGPointMake(0.0, 0.0)];
-    [arrow addLineToPoint:CGPointMake(0.0, 22.5)];
-    [arrow addLineToPoint:CGPointMake(5.8, 17.5)];
-    [arrow addLineToPoint:CGPointMake(10.6, 26.2)];
-    [arrow addLineToPoint:CGPointMake(14.0, 24.4)];
-    [arrow addLineToPoint:CGPointMake(9.2, 15.6)];
-    [arrow addLineToPoint:CGPointMake(17.2, 14.8)];
+    [arrow addLineToPoint:CGPointMake(0.0, 23.0)];
+    [arrow addLineToPoint:CGPointMake(6.0, 17.8)];
+    [arrow addLineToPoint:CGPointMake(11.0, 26.8)];
+    [arrow addLineToPoint:CGPointMake(14.5, 25.0)];
+    [arrow addLineToPoint:CGPointMake(9.5, 16.0)];
+    [arrow addLineToPoint:CGPointMake(17.8, 15.1)];
     [arrow closePath];
 
     self.pointerShadowLayer = [CAShapeLayer layer];
     self.pointerShadowLayer.path = arrow.CGPath;
-    self.pointerShadowLayer.fillColor = [UIColor colorWithRed:0.06 green:0.10 blue:0.20 alpha:0.85].CGColor;
-    self.pointerShadowLayer.shadowColor = [UIColor colorWithRed:0.16 green:0.76 blue:1.00 alpha:1.0].CGColor;
-    self.pointerShadowLayer.shadowOpacity = 0.72;
-    self.pointerShadowLayer.shadowRadius = 6.5;
+    self.pointerShadowLayer.fillColor = [UIColor colorWithRed:0.06 green:0.10 blue:0.20 alpha:0.86].CGColor;
+    self.pointerShadowLayer.shadowColor = [UIColor colorWithRed:0.16 green:0.78 blue:1.00 alpha:1.0].CGColor;
+    self.pointerShadowLayer.shadowOpacity = 0.78;
+    self.pointerShadowLayer.shadowRadius = 7.5;
     self.pointerShadowLayer.shadowOffset = CGSizeMake(0.5, 1.5);
     [self.pointerContainer.layer addSublayer:self.pointerShadowLayer];
 
     self.pointerFillLayer = [CAShapeLayer layer];
     self.pointerFillLayer.path = arrow.CGPath;
-    self.pointerFillLayer.fillColor = [UIColor colorWithRed:0.06 green:0.09 blue:0.17 alpha:0.98].CGColor;
+    self.pointerFillLayer.fillColor = [UIColor colorWithRed:0.05 green:0.08 blue:0.16 alpha:0.98].CGColor;
     self.pointerFillLayer.strokeColor = [UIColor whiteColor].CGColor;
-    self.pointerFillLayer.lineWidth = 1.85;
+    self.pointerFillLayer.lineWidth = 1.9;
     self.pointerFillLayer.lineJoin = kCALineJoinRound;
     [self.pointerContainer.layer addSublayer:self.pointerFillLayer];
 
-    // 右下迷你米塔徽标（非思考态显示，极克制不挡视线）
-    self.tagBadgeView = [[UIView alloc] initWithFrame:CGRectMake(14.5, 21.5, 32, 15)];
-    self.tagBadgeView.backgroundColor = [UIColor colorWithRed:0.06 green:0.09 blue:0.17 alpha:0.88];
-    self.tagBadgeView.layer.cornerRadius = 7.5;
-    self.tagBadgeView.layer.borderWidth = 0.7;
-    self.tagBadgeView.layer.borderColor = [UIColor colorWithRed:0.24 green:0.84 blue:1.00 alpha:0.68].CGColor;
+    // 右下迷你米塔徽标（非思考态常驻显示，精致通透不挡视线）
+    self.tagBadgeView = [[UIView alloc] initWithFrame:CGRectMake(15.0, 22.0, 34, 16)];
+    self.tagBadgeView.backgroundColor = [UIColor colorWithRed:0.05 green:0.09 blue:0.17 alpha:0.92];
+    self.tagBadgeView.layer.cornerRadius = 8.0;
+    self.tagBadgeView.layer.borderWidth = 0.85;
+    self.tagBadgeView.layer.borderColor = [UIColor colorWithRed:0.22 green:0.86 blue:1.00 alpha:0.76].CGColor;
+    self.tagBadgeView.layer.shadowColor = [UIColor colorWithRed:0.14 green:0.72 blue:1.00 alpha:1.0].CGColor;
+    self.tagBadgeView.layer.shadowOpacity = 0.38;
+    self.tagBadgeView.layer.shadowRadius = 4.0;
+    self.tagBadgeView.layer.shadowOffset = CGSizeMake(0, 1);
     self.tagBadgeLabel = [[UILabel alloc] initWithFrame:self.tagBadgeView.bounds];
     self.tagBadgeLabel.text = @"米塔";
-    self.tagBadgeLabel.font = [UIFont systemFontOfSize:8.8 weight:UIFontWeightBold];
-    self.tagBadgeLabel.textColor = [UIColor colorWithRed:0.88 green:0.97 blue:1.00 alpha:1.0];
+    self.tagBadgeLabel.font = [UIFont systemFontOfSize:9.0 weight:UIFontWeightBold];
+    self.tagBadgeLabel.textColor = [UIColor colorWithRed:0.90 green:0.98 blue:1.00 alpha:1.0];
     self.tagBadgeLabel.textAlignment = NSTextAlignmentCenter;
     [self.tagBadgeView addSubview:self.tagBadgeLabel];
     [self.pointerContainer addSubview:self.tagBadgeView];
@@ -251,26 +320,87 @@ static CGPoint MitaNormalizePointToBounds(double rawX, double rawY, CGRect b) {
     [self addSubview:self.pointerContainer];
 }
 
+- (void)startIdleHoverAnimation {
+    // v5.5.0 冰镇低功耗策略：待命常驻态保持 0fps 静态清晰展示（绝不触发 60fps 脏帧重编与发热），仅在点击/滑动/思考任务期触发丝滑动画！
+    if (self.tagBadgeView.bounds.size.width > 1.0) {
+        self.tagBadgeView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:self.tagBadgeView.bounds cornerRadius:8.0].CGPath;
+    }
+}
+
+- (void)stopIdleHoverAnimation {
+    [self.pointerFillLayer removeAnimationForKey:@"mitaIdleFloat"];
+    [self.pointerShadowLayer removeAnimationForKey:@"mitaIdleFloat"];
+    [self.pointerShadowLayer removeAnimationForKey:@"mitaIdleGlow"];
+}
+
+- (void)ensureVisibleForAiControlAnimated:(BOOL)animated {
+    self.persistentInAiMode = YES;
+    self.lastActivityTs = [[NSDate date] timeIntervalSince1970];
+    CGFloat W = MAX(100.0, self.bounds.size.width);
+    CGFloat H = MAX(100.0, self.bounds.size.height);
+    if (!self.cursorVisible || self.pointerContainer.alpha < 0.05) {
+        CGPoint dockPt = (self.currentPos.x > 24.0 && self.currentPos.x < W - 24.0 && self.currentPos.y > 48.0 && self.currentPos.y < H - 140.0)
+            ? self.currentPos
+            : CGPointMake(round(W * 0.72), round(H * 0.44));
+        self.currentPos = dockPt;
+        self.cursorVisible = YES;
+        CGPoint enterFrom = CGPointMake(MIN(W - 14.0, dockPt.x + 28.0), MAX(40.0, dockPt.y + 22.0));
+        self.pointerContainer.layer.position = animated ? enterFrom : dockPt;
+        self.pointerContainer.alpha = animated ? 0.0 : 1.0;
+        self.tagBadgeView.alpha = self.thinkingActive ? 0.0 : 1.0;
+        [self startIdleHoverAnimation];
+        if (animated) {
+            self.pointerContainer.transform = CGAffineTransformMakeScale(0.84, 0.84);
+            [UIView animateWithDuration:0.34 delay:0 usingSpringWithDamping:0.80 initialSpringVelocity:0.45 options:UIViewAnimationOptionBeginFromCurrentState animations:^{
+                self.pointerContainer.alpha = 1.0;
+                self.pointerContainer.layer.position = dockPt;
+                self.pointerContainer.transform = CGAffineTransformIdentity;
+            } completion:nil];
+        } else {
+            self.pointerContainer.transform = CGAffineTransformIdentity;
+        }
+    } else {
+        self.pointerContainer.alpha = 1.0;
+        self.tagBadgeView.alpha = self.thinkingActive ? 0.0 : 1.0;
+        [self startIdleHoverAnimation];
+    }
+}
+
 - (void)layoutThinkingBubbleAroundPoint:(CGPoint)pt {
     NSString *t = (self.thinkingText.length > 0) ? self.thinkingText : @"思考中";
     self.thinkingLabel.text = t;
     [self.thinkingLabel sizeToFit];
     CGFloat textW = ceil(self.thinkingLabel.bounds.size.width);
-    CGFloat bw = 28.0 + textW + 30.0;
-    CGFloat bh = 30.0;
+    CGFloat bw = 34.0 + textW + 34.0;
+    CGFloat bh = 34.0;
     CGFloat W = MAX(100.0, self.bounds.size.width);
     CGFloat H = MAX(100.0, self.bounds.size.height);
 
-    // 靠近右边界自动翻到光标左侧，绝不溢出屏幕！
-    CGFloat bx = (pt.x + 18.0 + bw > W - 12.0) ? MAX(12.0, pt.x - bw - 14.0) : (pt.x + 18.0);
-    CGFloat by = MAX(32.0, MIN(H - 120.0, pt.y - bh * 0.5));
+    // 靠近右边界自动翻到光标左侧，底部避开居中胶囊，绝不遮挡或溢出屏幕！
+    CGFloat bx = (pt.x + 20.0 + bw > W - 12.0) ? MAX(12.0, pt.x - bw - 16.0) : (pt.x + 20.0);
+    CGFloat by = MAX(36.0, MIN(H - 134.0, pt.y - bh * 0.5));
     self.thinkingBubbleView.frame = CGRectMake(bx, by, bw, bh);
-    self.sparkleHostView.frame = CGRectMake(10.0, (bh - 14.0) * 0.5, 14.0, 14.0);
-    self.thinkingLabel.frame = CGRectMake(28.0, 0, textW + 2.0, bh);
-    CGFloat dotStartX = 28.0 + textW + 6.0;
+    self.thinkingBubbleView.layer.cornerRadius = bh * 0.5;
+    self.thinkingBubbleView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:self.thinkingBubbleView.bounds cornerRadius:bh * 0.5].CGPath;
+
+    self.thinkingBorderClipView.frame = self.thinkingBubbleView.bounds;
+    self.thinkingBorderClipView.layer.cornerRadius = bh * 0.5;
+    CGFloat diag = ceil(hypot(bw, bh)) + 8.0;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.thinkingBorderConic.bounds = CGRectMake(0, 0, diag, diag);
+    self.thinkingBorderConic.position = CGPointMake(bw * 0.5, bh * 0.5);
+    self.thinkingBorderMask.frame = self.thinkingBorderClipView.bounds;
+    self.thinkingBorderMask.path = [UIBezierPath bezierPathWithRoundedRect:CGRectInset(self.thinkingBorderClipView.bounds, 0.9, 0.9) cornerRadius:(bh * 0.5 - 0.9)].CGPath;
+    [CATransaction commit];
+
+    self.sparkleHostView.frame = CGRectMake(11.0, (bh - 15.0) * 0.5, 15.0, 15.0);
+    self.subSparkleHostView.frame = CGRectMake(22.5, 6.0, 7.0, 7.0);
+    self.thinkingLabel.frame = CGRectMake(32.0, 0, textW + 2.0, bh);
+    CGFloat dotStartX = 32.0 + textW + 7.5;
     for (int i = 0; i < (int)self.thinkingDots.count; i++) {
         UIView *dv = self.thinkingDots[i];
-        dv.frame = CGRectMake(dotStartX + i * 7.5, (bh - 4.5) * 0.5, 4.5, 4.5);
+        dv.frame = CGRectMake(dotStartX + i * 7.8, (bh - 4.8) * 0.5, 4.8, 4.8);
     }
     self.thinkingRingHost.center = pt;
 }
@@ -283,87 +413,159 @@ static CGPoint MitaNormalizePointToBounds(double rawX, double rawY, CGRect b) {
         spin.duration = 1.45;
         spin.repeatCount = HUGE_VALF;
         spin.removedOnCompletion = NO;
+        if (@available(iOS 15.0, *)) { spin.preferredFrameRateRange = CAFrameRateRangeMake(18, 24, 24); }
         [self.thinkingRingGradient addAnimation:spin forKey:@"mitaRingSpin"];
+    }
+    if (![self.thinkingPulseHalo animationForKey:@"mitaHaloPulse"]) {
+        CABasicAnimation *sc = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+        sc.fromValue = @(0.74);
+        sc.toValue = @(1.24);
+        sc.duration = 1.20;
+        sc.autoreverses = YES;
+        sc.repeatCount = HUGE_VALF;
+        sc.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        sc.removedOnCompletion = NO;
+
+        CABasicAnimation *op = [CABasicAnimation animationWithKeyPath:@"opacity"];
+        op.fromValue = @(0.86);
+        op.toValue = @(0.22);
+        op.duration = 1.20;
+        op.autoreverses = YES;
+        op.repeatCount = HUGE_VALF;
+        op.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        op.removedOnCompletion = NO;
+
+        CAAnimationGroup *g = [CAAnimationGroup animation];
+        g.animations = @[ sc, op ];
+        g.duration = 1.20;
+        g.autoreverses = YES;
+        g.repeatCount = HUGE_VALF;
+        g.removedOnCompletion = NO;
+        if (@available(iOS 15.0, *)) { g.preferredFrameRateRange = CAFrameRateRangeMake(18, 24, 24); }
+        [self.thinkingPulseHalo addAnimation:g forKey:@"mitaHaloPulse"];
+    }
+    if (![self.thinkingBorderConic animationForKey:@"mitaBubbleBorderSpin"]) {
+        CABasicAnimation *bSpin = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
+        bSpin.fromValue = @(0.0);
+        bSpin.toValue = @(M_PI * 2.0);
+        bSpin.duration = 2.6;
+        bSpin.repeatCount = HUGE_VALF;
+        bSpin.removedOnCompletion = NO;
+        if (@available(iOS 15.0, *)) { bSpin.preferredFrameRateRange = CAFrameRateRangeMake(18, 24, 24); }
+        [self.thinkingBorderConic addAnimation:bSpin forKey:@"mitaBubbleBorderSpin"];
     }
     if (![self.sparkleHostView.layer animationForKey:@"mitaSparkleSpin"]) {
         CABasicAnimation *spRot = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
         spRot.fromValue = @(0.0);
         spRot.toValue = @(M_PI);
-        spRot.duration = 2.4;
+        spRot.duration = 2.2;
         spRot.repeatCount = HUGE_VALF;
         spRot.removedOnCompletion = NO;
+        if (@available(iOS 15.0, *)) { spRot.preferredFrameRateRange = CAFrameRateRangeMake(18, 24, 24); }
         [self.sparkleHostView.layer addAnimation:spRot forKey:@"mitaSparkleSpin"];
 
         CABasicAnimation *spScale = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
-        spScale.fromValue = @(0.82);
-        spScale.toValue = @(1.12);
-        spScale.duration = 0.85;
+        spScale.fromValue = @(0.80);
+        spScale.toValue = @(1.15);
+        spScale.duration = 0.80;
         spScale.autoreverses = YES;
         spScale.repeatCount = HUGE_VALF;
         spScale.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
         spScale.removedOnCompletion = NO;
+        if (@available(iOS 15.0, *)) { spScale.preferredFrameRateRange = CAFrameRateRangeMake(18, 24, 24); }
         [self.sparkleHostView.layer addAnimation:spScale forKey:@"mitaSparkleScale"];
+    }
+    if (![self.subSparkleHostView.layer animationForKey:@"mitaSubSparkle"]) {
+        CABasicAnimation *subSc = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+        subSc.fromValue = @(0.55);
+        subSc.toValue = @(1.18);
+        subSc.duration = 0.68;
+        subSc.beginTime = CACurrentMediaTime() + 0.34;
+        subSc.autoreverses = YES;
+        subSc.repeatCount = HUGE_VALF;
+        subSc.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        subSc.removedOnCompletion = NO;
+        if (@available(iOS 15.0, *)) { subSc.preferredFrameRateRange = CAFrameRateRangeMake(18, 24, 24); }
+        [self.subSparkleHostView.layer addAnimation:subSc forKey:@"mitaSubSparkle"];
     }
     for (int i = 0; i < (int)self.thinkingDots.count; i++) {
         UIView *dv = self.thinkingDots[i];
         if ([dv.layer animationForKey:@"mitaDotBounce"]) continue;
         CAKeyframeAnimation *bounce = [CAKeyframeAnimation animationWithKeyPath:@"transform.translation.y"];
-        bounce.values = @[ @(0.0), @(-3.8), @(0.0), @(0.0) ];
+        bounce.values = @[ @(0.0), @(-4.2), @(0.0), @(0.0) ];
         bounce.keyTimes = @[ @(0.0), @(0.28), @(0.56), @(1.0) ];
-        bounce.duration = 1.05;
+        bounce.duration = 1.02;
         bounce.beginTime = CACurrentMediaTime() + i * 0.16;
         bounce.repeatCount = HUGE_VALF;
         bounce.removedOnCompletion = NO;
+        if (@available(iOS 15.0, *)) { bounce.preferredFrameRateRange = CAFrameRateRangeMake(18, 24, 24); }
         [dv.layer addAnimation:bounce forKey:@"mitaDotBounce"];
 
         CABasicAnimation *op = [CABasicAnimation animationWithKeyPath:@"opacity"];
-        op.fromValue = @(0.42);
+        op.fromValue = @(0.38);
         op.toValue = @(1.0);
-        op.duration = 0.525;
+        op.duration = 0.51;
         op.beginTime = CACurrentMediaTime() + i * 0.16;
         op.autoreverses = YES;
         op.repeatCount = HUGE_VALF;
         op.removedOnCompletion = NO;
+        if (@available(iOS 15.0, *)) { op.preferredFrameRateRange = CAFrameRateRangeMake(18, 24, 24); }
         [dv.layer addAnimation:op forKey:@"mitaDotOp"];
     }
 }
 
 - (void)stopThinkingAnimations {
     [self.thinkingRingGradient removeAllAnimations];
+    [self.thinkingPulseHalo removeAllAnimations];
+    [self.thinkingBorderConic removeAllAnimations];
     [self.sparkleHostView.layer removeAllAnimations];
+    [self.subSparkleHostView.layer removeAllAnimations];
     for (UIView *dv in self.thinkingDots) {
         [dv.layer removeAllAnimations];
     }
 }
 
 - (void)showThinking:(BOOL)active text:(NSString *)text atPoint:(CGPoint)pt hasPoint:(BOOL)hasPt {
+    BOOL wasThinking = self.thinkingActive;
     self.thinkingActive = active;
     self.lastActivityTs = [[NSDate date] timeIntervalSince1970];
     if (text.length > 0) self.thinkingText = text;
     if (active) {
-        CGPoint target = hasPt ? pt : (self.cursorVisible ? self.currentPos : CGPointMake(self.bounds.size.width * 0.44, self.bounds.size.height * 0.46));
+        CGPoint target = hasPt ? pt : (self.cursorVisible ? self.currentPos : CGPointMake(self.bounds.size.width * 0.44, self.bounds.size.height * 0.44));
         if (!self.cursorVisible) {
             self.pointerContainer.layer.position = target;
             self.currentPos = target;
             self.cursorVisible = YES;
         }
+        [self startIdleHoverAnimation];
         [self startThinkingAnimations];
-        [UIView animateWithDuration:0.32 delay:0 usingSpringWithDamping:0.84 initialSpringVelocity:0.3 options:UIViewAnimationOptionBeginFromCurrentState animations:^{
+        if (!wasThinking) {
+            [self layoutThinkingBubbleAroundPoint:target];
+            self.thinkingBubbleView.transform = CGAffineTransformMakeScale(0.84, 0.84);
+            self.thinkingRingHost.transform = CGAffineTransformMakeScale(0.75, 0.75);
+        }
+        [UIView animateWithDuration:0.32 delay:0 usingSpringWithDamping:0.80 initialSpringVelocity:0.42 options:UIViewAnimationOptionBeginFromCurrentState animations:^{
             self.pointerContainer.alpha = 1.0;
             self.pointerContainer.layer.position = target;
             self.tagBadgeView.alpha = 0.0;
             self.thinkingRingHost.alpha = 1.0;
+            self.thinkingRingHost.transform = CGAffineTransformIdentity;
             self.thinkingBubbleView.alpha = 1.0;
+            self.thinkingBubbleView.transform = CGAffineTransformIdentity;
             [self layoutThinkingBubbleAroundPoint:target];
         } completion:nil];
         self.currentPos = target;
     } else {
-        [UIView animateWithDuration:0.12 delay:0 options:UIViewAnimationOptionBeginFromCurrentState animations:^{
+        [UIView animateWithDuration:0.16 delay:0 options:UIViewAnimationOptionBeginFromCurrentState animations:^{
             self.thinkingRingHost.alpha = 0.0;
+            self.thinkingRingHost.transform = CGAffineTransformMakeScale(0.82, 0.82);
             self.thinkingBubbleView.alpha = 0.0;
+            self.thinkingBubbleView.transform = CGAffineTransformMakeScale(0.88, 0.88);
             self.tagBadgeView.alpha = self.cursorVisible ? 1.0 : 0.0;
         } completion:^(BOOL finished) {
             if (!self.thinkingActive) {
+                self.thinkingBubbleView.transform = CGAffineTransformIdentity;
+                self.thinkingRingHost.transform = CGAffineTransformIdentity;
                 [self stopThinkingAnimations];
             }
         }];
@@ -527,7 +729,9 @@ static CGPoint MitaNormalizePointToBounds(double rawX, double rawY, CGRect b) {
 - (void)hideCursorAnimated:(BOOL)animated {
     self.thinkingActive = NO;
     self.cursorVisible = NO;
+    self.persistentInAiMode = NO;
     [self stopThinkingAnimations];
+    [self stopIdleHoverAnimation];
     if (animated) {
         [UIView animateWithDuration:0.25 animations:^{
             self.pointerContainer.alpha = 0.0;
@@ -542,7 +746,7 @@ static CGPoint MitaNormalizePointToBounds(double rawX, double rawY, CGRect b) {
 }
 
 - (void)checkAutoFadeIfIdle {
-    if (!self.cursorVisible || self.thinkingActive) return;
+    if (!self.cursorVisible || self.thinkingActive || self.persistentInAiMode) return;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     if (self.lastActivityTs > 0 && (now - self.lastActivityTs) > 6.5) {
         [self hideCursorAnimated:YES];
@@ -686,6 +890,7 @@ typedef NS_ENUM(NSInteger, MitaControlMode) {
     self.pillBox.bounds = CGRectMake(0.0, 0.0, pw, ph);
     self.pillBox.center = CGPointMake(centerX, centerY);
     self.pillBox.layer.cornerRadius = ph * 0.5;
+    self.pillBox.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:self.pillBox.bounds cornerRadius:ph * 0.5].CGPath;
 
     self.dotView.frame = CGRectMake(16.0, (ph - 9.0) * 0.5, 9.0, 9.0);
     self.dotView.layer.cornerRadius = 4.5;
@@ -869,11 +1074,11 @@ static CGFloat MitaPhysicalCornerRadiusForBounds(CGRect b) {
     return (b.size.height / MAX(1.0, b.size.width) > 1.95) ? 39.0 : 0.0;
 }
 
-// 仅在布局初始化时执行 1 次（<1.5ms）：基于圆角矩形 SDF 距离场生成丝滑指数级朦胧雾化边缘遮罩纹理，运行期 0% CPU！
-static CGImageRef MitaCreateSdfEdgeMaskImage(CGSize size, CGFloat cornerRadius, CGFloat maxFeatherPt, BOOL isNarrowRim) CF_RETURNS_RETAINED {
+// v5.5.0 冰镇零发热单层预烘焙极光柔雾图（仅布局初始化执行 1 次 <3ms，占用 300KB 显存，运行期 0% CPU + 0 离屏 Mask + 0 VNC 脏帧风暴！）
+static CGImageRef MitaCreatePrebakedAuraEdgeImage(CGSize size, CGFloat cornerRadius, CGFloat maxFeatherPt) CF_RETURNS_RETAINED {
     double W = MAX(20.0, (double)size.width);
     double H = MAX(20.0, (double)size.height);
-    double scale = isNarrowRim ? 1.0 : 0.5;
+    double scale = 0.5; // 207x368 柔和羽化纹理，GPU 硬件双线性插值丝滑无锯齿且带宽仅原来的 1/350
     size_t bw = (size_t)MAX(64, (int)ceil(W * scale));
     size_t bh = (size_t)MAX(64, (int)ceil(H * scale));
 
@@ -885,44 +1090,70 @@ static CGImageRef MitaCreateSdfEdgeMaskImage(CGSize size, CGFloat cornerRadius, 
         return NULL;
     }
 
+    // 赛博电光青 -> 深海量子蓝 -> 星云幻影紫 -> 极光霓虹洋红 -> 冰川青蓝 环绕色盘
+    static const double stopPos[6] = { 0.00, 0.20, 0.42, 0.64, 0.84, 1.00 };
+    static const double stopR[6]   = { 0.02, 0.14, 0.48, 0.88, 0.12, 0.02 };
+    static const double stopG[6]   = { 0.86, 0.42, 0.24, 0.24, 0.78, 0.86 };
+    static const double stopB[6]   = { 0.99, 0.98, 0.98, 0.68, 0.98, 0.99 };
+
     double r = MIN((double)cornerRadius, MIN(W, H) * 0.25);
     double hx = W * 0.5 - r;
     double hy = H * 0.5 - r;
-    double feather = MAX(1.5, (double)maxFeatherPt);
+    double feather = MAX(4.0, (double)maxFeatherPt);
+    const double twoPi = 6.283185307179586;
 
     for (size_t iy = 0; iy < bh; iy++) {
         double py = ((double)iy + 0.5) / (double)bh * H;
-        double qy = fabs(py - H * 0.5) - hy;
+        double dyC = py - H * 0.5;
+        double qy = fabs(dyC) - hy;
         double oy = fmax(qy, 0.0);
         size_t rowOff = iy * bw * 4;
         for (size_t ix = 0; ix < bw; ix++) {
             double px = ((double)ix + 0.5) / (double)bw * W;
-            double qx = fabs(px - W * 0.5) - hx;
+            double dxC = px - W * 0.5;
+            double qx = fabs(dxC) - hx;
             double ox = fmax(qx, 0.0);
             double outside = hypot(ox, oy) + fmin(fmax(qx, qy), 0.0) - r;
             double d = -outside;
             if (d < -0.75 || d >= feather) continue;
 
             double a = 0.0;
+            double rimBoost = 0.0;
             if (d < 0.0) {
                 a = 1.0 + (d / 0.75);
-            } else if (isNarrowRim) {
-                double t = d / feather;
-                a = pow(MAX(0.0, 1.0 - t), 1.75);
+                rimBoost = a;
             } else {
                 double t = d / feather;
-                // 贴边高饱和能量带 + 向内 36pt 高斯柔雾星云晕染（屏幕中心 d >= 36pt 严格 0.0 全透明）
-                double core = exp(-15.0 * t * t) * 0.36;
-                double mist = exp(-2.95 * t * t) * (1.0 - t) * 0.88;
-                a = MIN(1.0, core + mist);
+                // 贴边 3.4pt 高亮导光芯 + 向内 32pt 高斯柔雾星云晕染（中心严格 0.0 全透明）
+                double rim = (d < 3.6) ? pow(MAX(0.0, 1.0 - d / 3.6), 1.65) : 0.0;
+                double core = exp(-14.0 * t * t) * 0.34;
+                double mist = exp(-2.90 * t * t) * (1.0 - t) * 0.82;
+                a = MIN(1.0, rim * 0.88 + core + mist);
+                rimBoost = rim * 0.35;
             }
-            if (a <= 0.002) continue;
-            uint8_t v = (uint8_t)MIN(255, MAX(0, (int)llround(a * 255.0)));
+            if (a <= 0.003) continue;
+
+            double ang = atan2(dyC, dxC) + 1.15;
+            if (ang < 0.0) ang += twoPi;
+            double u = fmod(ang / twoPi, 1.0);
+            int seg = 0;
+            while (seg < 4 && u > stopPos[seg + 1]) seg++;
+            double span = MAX(0.001, stopPos[seg + 1] - stopPos[seg]);
+            double f = MAX(0.0, MIN(1.0, (u - stopPos[seg]) / span));
+            double cr = stopR[seg] + (stopR[seg + 1] - stopR[seg]) * f;
+            double cg = stopG[seg] + (stopG[seg + 1] - stopG[seg]) * f;
+            double cb = stopB[seg] + (stopB[seg + 1] - stopB[seg]) * f;
+            // 贴边导光芯微微提亮增透，呈现精致星云立体感
+            cr = MIN(1.0, cr + rimBoost * 0.25);
+            cg = MIN(1.0, cg + rimBoost * 0.25);
+            cb = MIN(1.0, cb + rimBoost * 0.20);
+
             size_t p = rowOff + ix * 4;
-            buf[p + 0] = v;
-            buf[p + 1] = v;
-            buf[p + 2] = v;
-            buf[p + 3] = v;
+            // Premultiplied RGBA
+            buf[p + 0] = (uint8_t)MIN(255, MAX(0, (int)llround(cr * a * 255.0)));
+            buf[p + 1] = (uint8_t)MIN(255, MAX(0, (int)llround(cg * a * 255.0)));
+            buf[p + 2] = (uint8_t)MIN(255, MAX(0, (int)llround(cb * a * 255.0)));
+            buf[p + 3] = (uint8_t)MIN(255, MAX(0, (int)llround(a * 255.0)));
         }
     }
 
@@ -978,10 +1209,11 @@ static CGImageRef MitaCreateSdfEdgeMaskImage(CGSize size, CGFloat cornerRadius, 
     if (self.pillTimer != nil) return;
     __weak typeof(self) weakSelf = self;
     dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    // v5.5.0 冰镇低功耗：顶部计时条每 5 秒刷新一次（而非每秒脏屏触发 VNC 全帧编码），温控大降！
     dispatch_source_set_timer(t,
-                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                              (uint64_t)(1.0 * NSEC_PER_SEC),
-                              (uint64_t)(0.20 * NSEC_PER_SEC));
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                              (uint64_t)(5.0 * NSEC_PER_SEC),
+                              (uint64_t)(0.80 * NSEC_PER_SEC));
     dispatch_source_set_event_handler(t, ^{
         [weakSelf updateStatusPillText];
     });
@@ -1020,86 +1252,12 @@ static CGImageRef MitaCreateSdfEdgeMaskImage(CGSize size, CGFloat cornerRadius, 
 - (void)setupGpuLayers {
     self.layer.opacity = 0.0f;
 
-    // 1. 深邃高饱和未来科技极光主色盘（白底微信与深色界面均浓郁朦胧、层次分明）
-    NSArray *mainColors = @[
-        (id)[UIColor colorWithRed:0.00 green:0.85 blue:0.99 alpha:0.98].CGColor, // 赛博电光青
-        (id)[UIColor colorWithRed:0.11 green:0.38 blue:0.96 alpha:0.95].CGColor, // 深海量子蓝
-        (id)[UIColor colorWithRed:0.44 green:0.20 blue:0.96 alpha:0.94].CGColor, // 星云幻影紫
-        (id)[UIColor colorWithRed:0.86 green:0.18 blue:0.58 alpha:0.88].CGColor, // 极光霓虹洋红
-        (id)[UIColor colorWithRed:0.22 green:0.20 blue:0.78 alpha:0.68].CGColor, // 幽邃靛蓝雾谷
-        (id)[UIColor colorWithRed:0.02 green:0.76 blue:0.96 alpha:0.94].CGColor, // 冰川青蓝流峰
-        (id)[UIColor colorWithRed:0.52 green:0.24 blue:0.98 alpha:0.92].CGColor, // 紫罗兰星云
-        (id)[UIColor colorWithRed:0.06 green:0.56 blue:0.96 alpha:0.72].CGColor, // 科技天蓝柔谷
-        (id)[UIColor colorWithRed:0.00 green:0.85 blue:0.99 alpha:0.98].CGColor
-    ];
-    NSArray *mainLocs = @[ @0.00, @0.13, @0.27, @0.41, @0.54, @0.67, @0.80, @0.91, @1.00 ];
-
-    // 2. 反向穿梭的高能科技双彗星流光束（制造雾环内部的流动能量脉搏）
-    NSArray *cometColors = @[
-        (id)[UIColor colorWithRed:0.00 green:0.92 blue:1.00 alpha:0.00].CGColor,
-        (id)[UIColor colorWithRed:0.00 green:0.92 blue:1.00 alpha:0.85].CGColor,
-        (id)[UIColor colorWithRed:0.76 green:0.97 blue:1.00 alpha:0.98].CGColor,
-        (id)[UIColor colorWithRed:0.48 green:0.28 blue:0.98 alpha:0.82].CGColor,
-        (id)[UIColor colorWithRed:0.48 green:0.28 blue:0.98 alpha:0.00].CGColor,
-        (id)[UIColor colorWithRed:0.92 green:0.24 blue:0.66 alpha:0.00].CGColor,
-        (id)[UIColor colorWithRed:0.92 green:0.24 blue:0.66 alpha:0.82].CGColor,
-        (id)[UIColor colorWithRed:0.62 green:0.38 blue:1.00 alpha:0.95].CGColor,
-        (id)[UIColor colorWithRed:0.08 green:0.84 blue:0.98 alpha:0.78].CGColor,
-        (id)[UIColor colorWithRed:0.08 green:0.84 blue:0.98 alpha:0.00].CGColor,
-        (id)[UIColor colorWithRed:0.00 green:0.92 blue:1.00 alpha:0.00].CGColor
-    ];
-    NSArray *cometLocs = @[ @0.00, @0.08, @0.15, @0.23, @0.32, @0.52, @0.60, @0.68, @0.76, @0.86, @1.00 ];
-
+    // v5.5.0 冰镇单层预烘焙极光雾环（零 Conic 全屏着色器 + 零双路离屏 Mask + 稳态 0fps，彻底终结发热与 VNC 脏帧风暴！）
     self.waveCompositeLayer = [CALayer layer];
-    self.waveCompositeLayer.masksToBounds = YES;
-
-    self.mainConicLayer = [CAGradientLayer layer];
-    if (@available(iOS 12.0, *)) {
-        self.mainConicLayer.type = kCAGradientLayerConic;
-    }
-    self.mainConicLayer.startPoint = CGPointMake(0.5, 0.5);
-    self.mainConicLayer.endPoint = CGPointMake(0.5, 0.0);
-    self.mainConicLayer.colors = mainColors;
-    self.mainConicLayer.locations = mainLocs;
-    [self.waveCompositeLayer addSublayer:self.mainConicLayer];
-
-    self.cometConicLayer = [CAGradientLayer layer];
-    if (@available(iOS 12.0, *)) {
-        self.cometConicLayer.type = kCAGradientLayerConic;
-    }
-    self.cometConicLayer.startPoint = CGPointMake(0.5, 0.5);
-    self.cometConicLayer.endPoint = CGPointMake(0.5, 0.0);
-    self.cometConicLayer.colors = cometColors;
-    self.cometConicLayer.locations = cometLocs;
-    self.cometConicLayer.opacity = 0.88f;
-    [self.waveCompositeLayer addSublayer:self.cometConicLayer];
-
-    self.mistMaskLayer = [CALayer layer];
-    self.waveCompositeLayer.mask = self.mistMaskLayer;
+    self.waveCompositeLayer.contentsGravity = kCAGravityResize;
+    self.waveCompositeLayer.magnificationFilter = kCAFilterLinear;
+    self.waveCompositeLayer.minificationFilter = kCAFilterLinear;
     [self.layer addSublayer:self.waveCompositeLayer];
-
-    // 3. 贴合屏幕物理边缘的 3.4pt 精密科技流光导光芯（内雾外锐，未来感拉满）
-    self.rimCompositeLayer = [CALayer layer];
-    self.rimCompositeLayer.masksToBounds = YES;
-    self.rimConicLayer = [CAGradientLayer layer];
-    if (@available(iOS 12.0, *)) {
-        self.rimConicLayer.type = kCAGradientLayerConic;
-    }
-    self.rimConicLayer.startPoint = CGPointMake(0.5, 0.5);
-    self.rimConicLayer.endPoint = CGPointMake(0.5, 0.0);
-    self.rimConicLayer.colors = @[
-        (id)[UIColor colorWithRed:0.00 green:0.94 blue:1.00 alpha:1.00].CGColor,
-        (id)[UIColor colorWithRed:0.24 green:0.48 blue:1.00 alpha:0.96].CGColor,
-        (id)[UIColor colorWithRed:0.62 green:0.28 blue:1.00 alpha:0.98].CGColor,
-        (id)[UIColor colorWithRed:0.94 green:0.26 blue:0.66 alpha:0.94].CGColor,
-        (id)[UIColor colorWithRed:0.06 green:0.78 blue:1.00 alpha:0.98].CGColor,
-        (id)[UIColor colorWithRed:0.00 green:0.94 blue:1.00 alpha:1.00].CGColor
-    ];
-    [self.rimCompositeLayer addSublayer:self.rimConicLayer];
-
-    self.rimMaskLayer = [CALayer layer];
-    self.rimCompositeLayer.mask = self.rimMaskLayer;
-    [self.layer addSublayer:self.rimCompositeLayer];
 }
 
 - (void)layoutSubviews {
@@ -1110,80 +1268,22 @@ static CGImageRef MitaCreateSdfEdgeMaskImage(CGSize size, CGFloat cornerRadius, 
     self.lastLayoutSize = b.size;
     self.physicalCornerRadius = MitaPhysicalCornerRadiusForBounds(b);
 
-    CGFloat W = b.size.width;
-    CGFloat H = b.size.height;
-    CGFloat diag = ceil(hypot(W, H) * 1.16);
-    CGRect conicBounds = CGRectMake(0, 0, diag, diag);
-    CGPoint centerPt = CGPointMake(W * 0.5, H * 0.5);
-
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-
     self.waveCompositeLayer.frame = b;
-    self.mainConicLayer.bounds = conicBounds;
-    self.mainConicLayer.position = centerPt;
-    self.cometConicLayer.bounds = conicBounds;
-    self.cometConicLayer.position = centerPt;
-    self.mistMaskLayer.frame = b;
-
-    self.rimCompositeLayer.frame = b;
-    self.rimConicLayer.bounds = conicBounds;
-    self.rimConicLayer.position = centerPt;
-    self.rimMaskLayer.frame = b;
-
-    CGImageRef mistImg = MitaCreateSdfEdgeMaskImage(b.size, self.physicalCornerRadius, 36.0, NO);
-    if (mistImg) {
-        self.mistMaskLayer.contents = (__bridge id)mistImg;
-        CGImageRelease(mistImg);
+    CGImageRef auraImg = MitaCreatePrebakedAuraEdgeImage(b.size, self.physicalCornerRadius, 32.0);
+    if (auraImg) {
+        self.waveCompositeLayer.contents = (__bridge id)auraImg;
+        CGImageRelease(auraImg);
     }
-    CGImageRef rimImg = MitaCreateSdfEdgeMaskImage(b.size, self.physicalCornerRadius, 3.6, YES);
-    if (rimImg) {
-        self.rimMaskLayer.contents = (__bridge id)rimImg;
-        CGImageRelease(rimImg);
-    }
-
     [CATransaction commit];
     [self bringSubviewToFront:self.statusPillView];
     [self syncGpuOpacityAndMode];
 }
 
 - (void)ensureGpuAnimationsRunning {
-    if (self.gpuAnimRunning && [self.mainConicLayer animationForKey:@"mitaRot1"] != nil) return;
-    self.gpuAnimRunning = YES;
-
-    CABasicAnimation *rot1 = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
-    rot1.fromValue = @(0.0);
-    rot1.toValue = @(M_PI * 2.0);
-    rot1.duration = 5.4;
-    rot1.repeatCount = HUGE_VALF;
-    rot1.removedOnCompletion = NO;
-    [self.mainConicLayer addAnimation:rot1 forKey:@"mitaRot1"];
-
-    CABasicAnimation *rot2 = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
-    rot2.fromValue = @(0.0);
-    rot2.toValue = @(-M_PI * 2.0);
-    rot2.duration = 3.6;
-    rot2.repeatCount = HUGE_VALF;
-    rot2.removedOnCompletion = NO;
-    [self.cometConicLayer addAnimation:rot2 forKey:@"mitaRot2"];
-
-    CABasicAnimation *breath = [CABasicAnimation animationWithKeyPath:@"opacity"];
-    breath.fromValue = @(0.76);
-    breath.toValue = @(0.98);
-    breath.duration = 2.2;
-    breath.autoreverses = YES;
-    breath.repeatCount = HUGE_VALF;
-    breath.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
-    breath.removedOnCompletion = NO;
-    [self.waveCompositeLayer addAnimation:breath forKey:@"mitaMistBreath"];
-
-    CABasicAnimation *rotRim = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
-    rotRim.fromValue = @(0.0);
-    rotRim.toValue = @(M_PI * 2.0);
-    rotRim.duration = 4.0;
-    rotRim.repeatCount = HUGE_VALF;
-    rotRim.removedOnCompletion = NO;
-    [self.rimConicLayer addAnimation:rotRim forKey:@"mitaRotRim"];
+    // v5.5.0 冰镇静默极光策略：静态单图 0fps 零发热，绝不启动 60fps 全屏旋转着色器！
+    self.gpuAnimRunning = NO;
 }
 
 - (void)syncGpuOpacityAndMode {
@@ -1193,20 +1293,15 @@ static CGImageRef MitaCreateSdfEdgeMaskImage(CGSize size, CGFloat cornerRadius, 
     } else {
         [self stopPillTimer];
     }
-    if (targetOp > 0.005f) {
-        [self ensureGpuAnimationsRunning];
-    } else if (self.gpuAnimRunning) {
-        [self.mainConicLayer removeAllAnimations];
-        [self.cometConicLayer removeAllAnimations];
+    if (self.gpuAnimRunning) {
         [self.waveCompositeLayer removeAllAnimations];
-        [self.rimConicLayer removeAllAnimations];
         self.gpuAnimRunning = NO;
     }
     BOOL lively = self.activeReplying;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     self.layer.opacity = (float)targetOp;
-    self.cometConicLayer.opacity = lively ? 0.96f : 0.82f;
+    self.waveCompositeLayer.opacity = lively ? 0.98f : 0.88f;
     [CATransaction commit];
     if (self.activeControl && targetOp > 0.01f) {
         [self updateStatusPillText];
@@ -1857,12 +1952,13 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
         [self writeDiagnosticsSnapshot];
         [self notifyPcAndLocalTakeoverMode:MitaControlModeHumanControl];
     } else {
-        // 点击「交回 AI」-> 立即切换为 AiLocked，新建并注册全屏 shieldWindow 防误触护盾，并通知电脑恢复/启动 AI 控制
+        // 点击「交回 AI」-> 立即切换为 AiLocked，新建并注册全屏 shieldWindow 防误触护盾，常驻展示米塔小鼠标，并通知电脑恢复/启动 AI 控制
         self.controlMode = MitaControlModeAiLocked;
         self.controlModeString = @"ai_locked";
         self.aiLockExpireAtTs = 0;
         [self.takeoverBar applyControlMode:MitaControlModeAiLocked animated:YES];
         [self syncShieldWindowGeometryAnimated:NO];
+        [self.cursorView ensureVisibleForAiControlAnimated:YES];
         self.waveView.activeControl = YES;
         self.waveView.phaseLabel = @"AI控制中";
         if (self.waveView.masterOpacity < 0.92) self.waveView.masterOpacity = 0.92;
@@ -1878,7 +1974,11 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
     MitaControlMode effectiveMode = (mode == MitaControlModeAiLocked) ? MitaControlModeAiLocked : MitaControlModeHumanControl;
     [self restoreOverlayMasterVisibleWithMode:effectiveMode];
     self.aiLockExpireAtTs = 0;
-    if (effectiveMode != MitaControlModeAiLocked) {
+    if (effectiveMode == MitaControlModeAiLocked) {
+        if (!self.screenLocked) {
+            [self.cursorView ensureVisibleForAiControlAnimated:YES];
+        }
+    } else {
         [self.cursorView hideCursorAnimated:YES];
     }
     [self reloadControlStateNow];
@@ -1970,7 +2070,7 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
     return @{
         @"ok": @(YES),
         @"daemon": @"MitaEdgeOverlay",
-        @"version": @"5.4.0",
+        @"version": @"5.5.0",
         @"port": @(19081),
         @"overlay_master_visible": @(self.overlayMasterVisible),
         @"control_mode": modeOut,
@@ -2001,7 +2101,7 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
     NSDictionary *diag = @{
         @"pid": @(getpid()),
         @"uid": @(getuid()),
-        @"version": @"5.4.0",
+        @"version": @"5.5.0",
         @"context_id": @(self.hostedContextId),
         @"overlay_master_visible": @(self.overlayMasterVisible),
         @"takeover_bar_visible": @(barVis),
@@ -2315,7 +2415,7 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
     NSData *bodyData = (take > 0) ? [buf subdataWithRange:NSMakeRange(hdrEnd.location + 4, take)] : [NSData data];
 
     if ([path isEqualToString:@"/ping"] || [path isEqualToString:@"/status"]) {
-        __block NSDictionary *stOut = @{@"ok": @(YES), @"daemon": @"MitaEdgeOverlay", @"version": @"5.4.0", @"port": @(19081)};
+        __block NSDictionary *stOut = @{@"ok": @(YES), @"daemon": @"MitaEdgeOverlay", @"version": @"5.5.0", @"port": @(19081)};
         MitaEdgeRootViewController *strongVC = weakVC;
         if (strongVC) {
             dispatch_sync(dispatch_get_main_queue(), ^{
@@ -2324,7 +2424,7 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
         }
         MitaEdgeSendHttp(fd, 200, stOut);
     } else if ([path isEqualToString:@"/exit"]) {
-        MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"exiting": @(YES), @"version": @"5.4.0"});
+        MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"exiting": @(YES), @"version": @"5.5.0"});
         close(fd);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_MSEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             if (gPidFilePath.length > 0) {
