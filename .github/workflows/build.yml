@@ -22,7 +22,7 @@ jobs:
             -framework AVFoundation \
             -framework CoreGraphics \
             -framework Vision \
-            -framework Photos \\
+            -framework Photos \
             -lz \
             main.m AppDelegate.m MainViewController.m \
             MitaConfigStore.m MitaKeepAliveAndControl.m \
@@ -36,7 +36,7 @@ jobs:
             -framework Foundation \
             -framework CoreGraphics \
             -framework QuartzCore \
-            -framework Photos \\
+            -framework Photos \
             MitaEdgeOverlayApp.m \
             -o MitaEdgeOverlay_arm64
 
