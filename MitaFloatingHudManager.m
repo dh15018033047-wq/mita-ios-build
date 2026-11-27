@@ -120,7 +120,7 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
     if (![obj isKindOfClass:[NSDictionary class]]) return NO;
     NSString *ver = [obj[@"version"] isKindOfClass:[NSString class]] ? obj[@"version"] : @"";
     if (ver.length == 0) return NO;
-    return ([ver isEqualToString:@"5.5.0"] || [ver compare:@"5.5.0" options:NSNumericSearch] != NSOrderedAscending);
+    return ([ver isEqualToString:@"5.6.0"] || [ver compare:@"5.6.0" options:NSNumericSearch] != NSOrderedAscending);
 }
 
 - (BOOL)isActive {
@@ -129,17 +129,20 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
 }
 
 - (BOOL)ensureOverlayDaemonLaunched {
-    if (![MitaConfigStore shared].floatingHudEnabled || ![MitaConfigStore shared].remoteControlEnabled) {
+    // v5.6.0: 即使当前关闭了远程总控或悬浮框，也允许以 0fps 隐身零功耗待命态常驻监听 :19081，
+    // 让电脑端无需用户手动开启「远程操控」就能随时自动发现手机并远程一键唤醒接管！
+    BOOL activeUi = ([MitaConfigStore shared].floatingHudEnabled && [MitaConfigStore shared].remoteControlEnabled);
+    if (activeUi) {
+        [self ensureKeepSyncTimerStarted];
+    } else {
         [self stopKeepSyncTimer];
-        return NO;
     }
-    [self ensureKeepSyncTimerStarted];
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     if ([self isDaemonAlive]) {
         if ([self isDaemonVersionCurrent] || (now - self.lastSpawnAttemptTs) < 4.0) {
             return YES;
         }
-        // 检测到旧版 MitaEdgeOverlay 残留进程：先发 /exit 请求，再继续拉起新版 5.3.0 守护完成 Root 级清退接管
+        // 检测到旧版 MitaEdgeOverlay 残留进程：先发 /exit 请求，再拉起新版 5.6.0 守护完成接管
         NSURL *exitUrl = [NSURL URLWithString:@"http://127.0.0.1:19081/exit"];
         if (exitUrl) {
             NSMutableURLRequest *exitReq = [NSMutableURLRequest requestWithURL:exitUrl];
@@ -457,16 +460,10 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
     // 2. 写入最新 mita_edge_state.json 并广播
     [self writeAndNotifyEdgeState];
 
-    // 3. 只要关闭了悬浮框或关闭了远程总控，立即异步请求 :19081/exit 并彻底终止守护进程！
-    if (![MitaConfigStore shared].floatingHudEnabled || ![MitaConfigStore shared].remoteControlEnabled) {
-        NSURL *exitUrl = [NSURL URLWithString:@"http://127.0.0.1:19081/exit"];
-        if (exitUrl) {
-            NSMutableURLRequest *exitReq = [NSMutableURLRequest requestWithURL:exitUrl];
-            exitReq.HTTPMethod = @"POST";
-            exitReq.timeoutInterval = 0.50;
-            [[[NSURLSession sharedSession] dataTaskWithRequest:exitReq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {}] resume];
-        }
-        [self terminateOverlayDaemon];
+    // 3. v5.6.0 零功耗隐身待命：关闭悬浮框或关闭远程总控时仅隐藏全部悬浮窗口与撤除护盾（0fps 零发烫），
+    // 绝不杀死 :19081 轻量监听进程，确保电脑端无需手机端手动打开「远程操控」即可随时自动发现并一键唤醒控制！
+    if (![self isDaemonAlive]) {
+        [self ensureOverlayDaemonLaunched];
     }
 }
 

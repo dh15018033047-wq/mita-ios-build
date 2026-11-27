@@ -9,6 +9,7 @@
 #import <signal.h>
 #import <unistd.h>
 #import <sys/stat.h>
+#import <sys/sysctl.h>
 #import <sys/socket.h>
 #import <sys/select.h>
 #import <netinet/in.h>
@@ -883,41 +884,43 @@ typedef NS_ENUM(NSInteger, MitaControlMode) {
     self.pillBox.hidden = NO;
     self.pillBox.alpha = 1.0;
 
-    // v5.4.0：大号易按 + 严格正居中：AiLocked 与 HumanControl 100% 共享完全一致的 244x46 尺寸与正中间中心点，右侧主按钮 106x34，bounds + center 与 transform 解耦
-    CGFloat pw = 244.0, ph = 46.0;
+    // v5.6.0：合并上移至顶部状态栏居中精巧灵动岛一体胶囊（y=1..27 / 刘海屏 y=34..60），
+    // 0% 遮挡底部键盘（数字 7/8/9 及字母区）、0% 遮挡底栏与内容区、0% 干扰其他 AI 触摸！
+    CGFloat pw = 196.0, ph = 24.0;
     CGFloat centerX = round(W * 0.5);
-    CGFloat centerY = round(H - bottomSafe - 58.0 - ph * 0.5);
+    CGFloat topY = isModern ? 34.0 : 1.0;
+    CGFloat centerY = round(topY + ph * 0.5);
     self.pillBox.bounds = CGRectMake(0.0, 0.0, pw, ph);
     self.pillBox.center = CGPointMake(centerX, centerY);
     self.pillBox.layer.cornerRadius = ph * 0.5;
     self.pillBox.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:self.pillBox.bounds cornerRadius:ph * 0.5].CGPath;
 
-    self.dotView.frame = CGRectMake(16.0, (ph - 9.0) * 0.5, 9.0, 9.0);
-    self.dotView.layer.cornerRadius = 4.5;
-    self.statusLabel.frame = CGRectMake(32.0, 0.0, 96.0, ph);
-    self.actionButton.frame = CGRectMake(pw - 106.0 - 6.0, (ph - 34.0) * 0.5, 106.0, 34.0);
-    self.actionButton.layer.cornerRadius = 17.0;
-    self.actionButton.titleLabel.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightBold];
+    self.dotView.frame = CGRectMake(10.0, (ph - 6.5) * 0.5, 6.5, 6.5);
+    self.dotView.layer.cornerRadius = 3.25;
+    self.statusLabel.frame = CGRectMake(21.0, 0.0, 92.0, ph);
+    self.actionButton.frame = CGRectMake(pw - 74.0 - 3.0, (ph - 18.0) * 0.5, 74.0, 18.0);
+    self.actionButton.layer.cornerRadius = 9.0;
+    self.actionButton.titleLabel.font = [UIFont systemFontOfSize:10.5 weight:UIFontWeightBold];
 
     if (self.controlMode == MitaControlModeAiLocked) {
-        self.pillBox.backgroundColor = [UIColor colorWithRed:0.06 green:0.08 blue:0.14 alpha:0.96];
+        self.pillBox.backgroundColor = [UIColor colorWithRed:0.06 green:0.08 blue:0.14 alpha:0.95];
         self.pillBox.layer.borderColor = [UIColor colorWithRed:0.28 green:0.80 blue:1.00 alpha:0.82].CGColor;
         self.dotView.backgroundColor = [UIColor colorWithRed:0.16 green:0.86 blue:0.98 alpha:1.0];
 
         self.statusLabel.text = @"AI 控制中";
-        self.statusLabel.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightSemibold];
+        self.statusLabel.font = [UIFont systemFontOfSize:10.8 weight:UIFontWeightSemibold];
         self.statusLabel.textColor = [UIColor colorWithRed:0.94 green:0.98 blue:1.00 alpha:0.99];
 
         self.actionButton.backgroundColor = [UIColor whiteColor];
         [self.actionButton setTitle:@"我来接管" forState:UIControlStateNormal];
         [self.actionButton setTitleColor:[UIColor colorWithRed:0.06 green:0.09 blue:0.17 alpha:1.0] forState:UIControlStateNormal];
     } else {
-        self.pillBox.backgroundColor = [UIColor colorWithRed:0.05 green:0.12 blue:0.15 alpha:0.95];
+        self.pillBox.backgroundColor = [UIColor colorWithRed:0.05 green:0.12 blue:0.15 alpha:0.94];
         self.pillBox.layer.borderColor = [UIColor colorWithRed:0.18 green:0.86 blue:0.58 alpha:0.88].CGColor;
         self.dotView.backgroundColor = [UIColor colorWithRed:0.20 green:0.90 blue:0.58 alpha:1.0];
 
         self.statusLabel.text = @"我来控制";
-        self.statusLabel.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightSemibold];
+        self.statusLabel.font = [UIFont systemFontOfSize:10.8 weight:UIFontWeightSemibold];
         self.statusLabel.textColor = [UIColor colorWithRed:0.93 green:1.00 blue:0.97 alpha:0.99];
 
         self.actionButton.backgroundColor = [UIColor colorWithRed:0.06 green:0.74 blue:0.52 alpha:1.0];
@@ -925,8 +928,8 @@ typedef NS_ENUM(NSInteger, MitaControlMode) {
         [self.actionButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     }
 
-    self.hintToastLabel.bounds = CGRectMake(0.0, 0.0, 260.0, 28.0);
-    self.hintToastLabel.center = CGPointMake(centerX, centerY - ph * 0.5 - 24.0);
+    self.hintToastLabel.bounds = CGRectMake(0.0, 0.0, 248.0, 24.0);
+    self.hintToastLabel.center = CGPointMake(centerX, topY + ph + 18.0);
 }
 
 - (void)layoutSubviews {
@@ -1201,7 +1204,9 @@ static CGImageRef MitaCreatePrebakedAuraEdgeImage(CGSize size, CGFloat cornerRad
     self.statusPillLabel.textColor = [UIColor colorWithRed:0.95 green:0.98 blue:1.00 alpha:0.98];
     self.statusPillLabel.textAlignment = NSTextAlignmentLeft;
     [self.statusPillView addSubview:self.statusPillLabel];
-
+    // v5.6.0：顶部灵动岛已合并为唯一精巧控制条（MitaTakeoverBarView），隐藏旧重复计时微章避免顶部两坨黑条重叠
+    self.statusPillView.hidden = YES;
+    self.statusPillView.alpha = 0.0;
     [self addSubview:self.statusPillView];
 }
 
@@ -1730,6 +1735,36 @@ static NSString *MitaControlModeName(MitaControlMode m) {
 
 - (void)onPollTick {
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    // v5.6.0：无论当前是否开启远程总控，每 30 秒由后台低优先级向电脑端发一次极轻发现心跳，
+    // 确保电脑无需用户先在手机点开「远程操控」即可自动发现手机在线并随时按需拉起控制！
+    static NSTimeInterval sLastStandbyHbTs = 0.0;
+    if ((now - sLastStandbyHbTs) >= 30.0) {
+        sLastStandbyHbTs = now;
+        NSString *pcBase = (self.pcCallbackUrl.length > 6) ? self.pcCallbackUrl : @"http://192.168.1.34:18765";
+        while ([pcBase hasSuffix:@"/"]) pcBase = [pcBase substringToIndex:pcBase.length - 1];
+        NSURL *hbUrl = [NSURL URLWithString:[pcBase stringByAppendingString:@"/api/phone_agent/heartbeat"]];
+        if (hbUrl) {
+            NSDictionary *hbBody = @{
+                @"platform": @"ios",
+                @"app": @"MitaEdgeOverlay",
+                @"version": @"5.6.0",
+                @"port": @(19081),
+                @"daemon": @"MitaEdgeOverlay",
+                @"standby_discoverable": @(YES),
+                @"remote_control_enabled": @(self.overlayMasterVisible),
+                @"control_mode": (!self.overlayMasterVisible) ? @"off" : (self.controlModeString ?: @"human_control")
+            };
+            NSData *jdHb = [NSJSONSerialization dataWithJSONObject:hbBody options:0 error:nil];
+            if (jdHb) {
+                NSMutableURLRequest *reqHb = [NSMutableURLRequest requestWithURL:hbUrl];
+                reqHb.HTTPMethod = @"POST";
+                reqHb.timeoutInterval = 2.0;
+                [reqHb setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+                reqHb.HTTPBody = jdHb;
+                [[[NSURLSession sharedSession] dataTaskWithRequest:reqHb completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {}] resume];
+            }
+        }
+    }
     if (!self.overlayMasterVisible) {
         if (self.takeoverBar) {
             self.takeoverBar.masterHidden = YES;
@@ -2070,8 +2105,10 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
     return @{
         @"ok": @(YES),
         @"daemon": @"MitaEdgeOverlay",
-        @"version": @"5.5.0",
+        @"version": @"5.6.0",
         @"port": @(19081),
+        @"standby_discoverable": @(YES),
+        @"remote_enabled": @(self.overlayMasterVisible),
         @"overlay_master_visible": @(self.overlayMasterVisible),
         @"control_mode": modeOut,
         @"glow_ignores_hit_test": @(YES),
@@ -2101,7 +2138,9 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
     NSDictionary *diag = @{
         @"pid": @(getpid()),
         @"uid": @(getuid()),
-        @"version": @"5.5.0",
+        @"version": @"5.6.0",
+        @"standby_discoverable": @(YES),
+        @"remote_enabled": @(self.overlayMasterVisible),
         @"context_id": @(self.hostedContextId),
         @"overlay_master_visible": @(self.overlayMasterVisible),
         @"takeover_bar_visible": @(barVis),
@@ -2415,7 +2454,7 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
     NSData *bodyData = (take > 0) ? [buf subdataWithRange:NSMakeRange(hdrEnd.location + 4, take)] : [NSData data];
 
     if ([path isEqualToString:@"/ping"] || [path isEqualToString:@"/status"]) {
-        __block NSDictionary *stOut = @{@"ok": @(YES), @"daemon": @"MitaEdgeOverlay", @"version": @"5.5.0", @"port": @(19081)};
+        __block NSDictionary *stOut = @{@"ok": @(YES), @"daemon": @"MitaEdgeOverlay", @"version": @"5.6.0", @"port": @(19081), @"standby_discoverable": @(YES)};
         MitaEdgeRootViewController *strongVC = weakVC;
         if (strongVC) {
             dispatch_sync(dispatch_get_main_queue(), ^{
@@ -2424,7 +2463,7 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
         }
         MitaEdgeSendHttp(fd, 200, stOut);
     } else if ([path isEqualToString:@"/exit"]) {
-        MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"exiting": @(YES), @"version": @"5.5.0"});
+        MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"exiting": @(YES), @"version": @"5.6.0"});
         close(fd);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_MSEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             if (gPidFilePath.length > 0) {
@@ -2526,14 +2565,26 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
                         id old = [NSJSONSerialization JSONObjectWithData:raw options:0 error:nil];
                         if ([old isKindOfClass:[NSDictionary class]]) [st addEntriesFromDictionary:old];
                     }
-                    if (st[@"edge_enabled"] == nil || [st[@"edge_enabled"] boolValue]) {
-                        st[@"edge_enabled"] = @(YES);
-                        st[@"remote_enabled"] = @(YES);
-                        st[@"updated_at"] = @([[NSDate date] timeIntervalSince1970]);
-                        NSData *jd = [NSJSONSerialization dataWithJSONObject:st options:0 error:nil];
-                        if (jd) {
-                            [jd writeToFile:gStateFilePath atomically:YES];
-                            chmod([gStateFilePath UTF8String], 0666);
+                    // v5.6.0: 电脑端主动唤醒接管时强制置 edge_enabled & remote_enabled 为 YES，无需手机端先手动开启！
+                    st[@"edge_enabled"] = @(YES);
+                    st[@"remote_enabled"] = @(YES);
+                    st[@"updated_at"] = @([[NSDate date] timeIntervalSince1970]);
+                    NSData *jd = [NSJSONSerialization dataWithJSONObject:st options:0 error:nil];
+                    if (jd) {
+                        [jd writeToFile:gStateFilePath atomically:YES];
+                        chmod([gStateFilePath UTF8String], 0666);
+                    }
+                    // 异步顺带同步本机主 App :19080 远程开关状态（若主 App 挂起也完全不影响 :19081 即刻生效）
+                    NSURL *u19080 = [NSURL URLWithString:@"http://127.0.0.1:19080/toggle_remote"];
+                    if (u19080) {
+                        NSData *b19 = [NSJSONSerialization dataWithJSONObject:@{@"remote_control_enabled": @(YES)} options:0 error:nil];
+                        if (b19) {
+                            NSMutableURLRequest *r19 = [NSMutableURLRequest requestWithURL:u19080];
+                            r19.HTTPMethod = @"POST";
+                            r19.timeoutInterval = 0.45;
+                            [r19 setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+                            r19.HTTPBody = b19;
+                            [[[NSURLSession sharedSession] dataTaskWithRequest:r19 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {}] resume];
                         }
                     }
                 }
@@ -2545,6 +2596,38 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
                 }
                 MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_control_mode", @"control_mode": MitaControlModeName(mode), @"version": @"5.2.0"});
             }
+        } else if ([actType isEqualToString:@"clean_capture_pause"]) {
+            // v5.6.0 AI 纯净截屏专用瞬时隐身门：拍完即刻自动恢复，确保 AI 看到的永远是无悬浮框、无鼠标、无蓝边的纯净原屏！
+            double hideMs = dict[@"ms"] ? [dict[@"ms"] doubleValue] : 380.0;
+            if (hideMs < 80.0) hideMs = 80.0;
+            if (hideMs > 2500.0) hideMs = 2500.0;
+            MitaEdgeRootViewController *strongVC = weakVC;
+            if (strongVC) {
+                dispatch_sync(dispatch_get_main_queue(), ^{
+                    strongVC.view.hidden = YES;
+                    [CATransaction flush];
+                });
+                static uint64_t sCleanCapSeq = 0;
+                uint64_t mySeq = ++sCleanCapSeq;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(hideMs * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+                    if (sCleanCapSeq == mySeq && strongVC && strongVC.overlayMasterVisible && !strongVC.screenLocked) {
+                        strongVC.view.hidden = NO;
+                        [CATransaction flush];
+                    }
+                });
+            }
+            MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_clean_pause", @"ms": @(hideMs), @"version": @"5.6.0"});
+        } else if ([actType isEqualToString:@"clean_capture_resume"]) {
+            MitaEdgeRootViewController *strongVC = weakVC;
+            if (strongVC) {
+                dispatch_sync(dispatch_get_main_queue(), ^{
+                    if (strongVC.overlayMasterVisible && !strongVC.screenLocked) {
+                        strongVC.view.hidden = NO;
+                        [CATransaction flush];
+                    }
+                });
+            }
+            MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_clean_resume", @"version": @"5.6.0"});
         } else if ([actType isEqualToString:@"passthrough"]) {
             double pMs = dict[@"ms"] ? [dict[@"ms"] doubleValue] : (dict[@"passthrough_ms"] ? [dict[@"passthrough_ms"] doubleValue] : 600.0);
             MitaEdgeRootViewController *strongVC = weakVC;
@@ -2811,6 +2894,16 @@ static void MitaStartEdgeDaemonHttpServer(MitaEdgeRootViewController * __weak we
     self.window.hidden = NO;
     [self.window makeKeyAndVisible];
 
+    // v5.6.0：对 MitaGlowWindow 应用 iOS 原生防截屏硬件屏蔽标志 (UITextField secure canvas / CALayer disableUpdateMask)，
+    // 使手机真机显示屏 100% 清晰可见，同时尽量在硬件层直接对系统截图/录屏/Remote4 隐藏悬浮框与鼠标！
+    @try {
+        SEL maskSel = NSSelectorFromString(@"setDisableUpdateMask:");
+        if ([self.window.layer respondsToSelector:maskSel]) {
+            // bit 4 (0x10 = kCALayerDisableUpdateCapture): 仅屏蔽截屏/录屏抓取，真机物理显示屏正常渲染可见！
+            ((void (*)(id, SEL, unsigned int))objc_msgSend)(self.window.layer, maskSel, 0x10);
+        }
+    } @catch (NSException *ex) {}
+
     [self ensureOverlayWindowVisibleAndHosted];
     [self.rootVC syncShieldWindowGeometryAnimated:NO];
 
@@ -2864,11 +2957,38 @@ int main(int argc, char *argv[]) {
             return 0;
         }
 
-        // 启动新实例前，若已有旧 PID 存活先清理，确保全屏永远单实例无重影
+        // v5.6.0 彻底根治真机双鼠标重影：通过 sysctl 扫描全系统进程表，清除所有同名 MitaEdgeOverlay 旧/孤儿实例（不仅依赖单个 PID 文件）！
+        pid_t meSelf = getpid();
+        int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+        size_t procBufSize = 0;
+        if (sysctl(mib, 4, NULL, &procBufSize, NULL, 0) == 0 && procBufSize > 0) {
+            struct kinfo_proc *procs = (struct kinfo_proc *)malloc(procBufSize);
+            if (procs) {
+                if (sysctl(mib, 4, procs, &procBufSize, NULL, 0) == 0) {
+                    size_t procCount = procBufSize / sizeof(struct kinfo_proc);
+                    BOOL killedAny = NO;
+                    for (size_t i = 0; i < procCount; i++) {
+                        pid_t pp = procs[i].kp_proc.p_pid;
+                        if (pp > 1 && pp != meSelf) {
+                            const char *comm = procs[i].kp_proc.p_comm;
+                            if (comm && strncmp(comm, "MitaEdgeOverlay", 15) == 0) {
+                                kill(pp, SIGKILL);
+                                killedAny = YES;
+                            }
+                        }
+                    }
+                    if (killedAny) {
+                        usleep(120000);
+                    }
+                }
+                free(procs);
+            }
+        }
+        // 同步清理 PID 文件记录的旧进程
         NSString *prevPidStr = [NSString stringWithContentsOfFile:gPidFilePath encoding:NSUTF8StringEncoding error:nil];
         if (prevPidStr.length > 0) {
             pid_t prevPid = (pid_t)[prevPidStr intValue];
-            if (prevPid > 1 && prevPid != getpid() && kill(prevPid, 0) == 0) {
+            if (prevPid > 1 && prevPid != meSelf && kill(prevPid, 0) == 0) {
                 kill(prevPid, SIGKILL);
                 usleep(80000);
             }

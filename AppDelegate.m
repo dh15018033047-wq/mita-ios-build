@@ -30,7 +30,8 @@
     self.window.rootViewController = self.rootVC;
     [self.window makeKeyAndVisible];
 
-    // 同步全局远程控制边缘流光状态（不再绑死微信自动回复！）
+    // 同步全局远程控制边缘流光状态（v5.6.0：即便关闭远程总控也保持 :19081 零功耗隐身待命，方便电脑随时自动发现并拉起！）
+    [[MitaFloatingHudManager shared] ensureOverlayDaemonLaunched];
     if (store.remoteControlEnabled) {
         [[MitaFloatingHudManager shared] syncPlaybackState];
         [[MitaAiGroupEngine shared] bootstrapRuntimeIfNeeded];
@@ -48,11 +49,13 @@
         [[MitaKeepAliveAndControl shared] stopSilentKeepAlive];
     }
     [[MitaLanServer shared] restartListenerIfNeeded];
+    [[MitaFloatingHudManager shared] ensureOverlayDaemonLaunched];
     if (store.remoteControlEnabled) {
         [[MitaLanServer shared] resumeBackgroundHeartbeat];
         [[MitaFloatingHudManager shared] syncPlaybackState];
     } else {
         [[MitaLanServer shared] pauseBackgroundHeartbeat];
+        [[MitaFloatingHudManager shared] stopFloatingWindow];
     }
     [self.rootVC notifyHostResume];
 }

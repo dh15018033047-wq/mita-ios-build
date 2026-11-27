@@ -1214,7 +1214,9 @@
 
     BOOL pcRunning = [respDict[@"running"] boolValue];
     if (!pcRunning && self.isAutoReplyRunning) {
-        [self notifyPcToggleRunning:YES];
+        // 电脑端已明确停机或人工接管，顺从电脑端停机状态，严禁反推把电脑端强行复活！
+        [self setAutoReplyRunning:NO launchWeChat:NO triggerSource:@"pc_sync_stop"];
+        return YES;
     }
 
     NSDictionary *mon = [respDict[@"monitor"] isKindOfClass:[NSDictionary class]] ? respDict[@"monitor"] : @{};
