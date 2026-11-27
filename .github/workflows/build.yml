@@ -1,4 +1,4 @@
-name: Build MitaPhoneAgent iOS arm64
+﻿name: Build MitaPhoneAgent iOS arm64
 on:
   push:
     branches: [ main ]
@@ -22,6 +22,7 @@ jobs:
             -framework AVFoundation \
             -framework CoreGraphics \
             -framework Vision \
+            -framework Photos \\
             -lz \
             main.m AppDelegate.m MainViewController.m \
             MitaConfigStore.m MitaKeepAliveAndControl.m \
@@ -35,6 +36,7 @@ jobs:
             -framework Foundation \
             -framework CoreGraphics \
             -framework QuartzCore \
+            -framework Photos \\
             MitaEdgeOverlayApp.m \
             -o MitaEdgeOverlay_arm64
 

@@ -4,6 +4,8 @@
 #import "MitaAiGroupEngine.h"
 #import "MitaFloatingHudManager.h"
 #import <UIKit/UIKit.h>
+#import <Photos/Photos.h>
+#import <AVFoundation/AVFoundation.h>
 #import <sys/socket.h>
 #import <sys/select.h>
 #import <netinet/in.h>
@@ -104,8 +106,12 @@
         @"platform": @"ios",
         @"app": @"MitaPhoneAgent",
         @"app_title": @"米塔 手机智能体 (巨魔版)",
-        @"version": @"5.6.0",
+        @"version": @"5.7.0",
         @"standby_discoverable": @(YES),
+        @"push_media_supported": @(YES),
+        @"perm_photos": @([PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite] == PHAuthorizationStatusAuthorized || [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite] == PHAuthorizationStatusLimited),
+        @"perm_camera": @([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo] == AVAuthorizationStatusAuthorized),
+        @"perm_mic": @([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio] == AVAuthorizationStatusAuthorized),
         @"model": [MitaKeepAliveAndControl deviceModelName],
         @"ios_version": self.cachedIosVersion ?: @"15.8.2",
         @"width": @(self.cachedWidth > 0 ? self.cachedWidth : 1242),
@@ -252,18 +258,82 @@
     if (body.length > 0) send(fd, body.bytes, body.length, 0);
 }
 
+- (NSDictionary *)saveMediaBytesToPhotos:(NSData *)rawBytes filename:(NSString *)filename {
+    if (!rawBytes || rawBytes.length == 0) {
+        return @{@"ok": @(NO), @"error": @"empty_media_bytes"};
+    }
+    NSMutableString *clean = [NSMutableString string];
+    NSString *rawName = filename ?: @"";
+    for (NSUInteger i = 0; i < rawName.length; i++) {
+        unichar ch = [rawName characterAtIndex:i];
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-') {
+            [clean appendFormat:@"%C", ch];
+        } else {
+            [clean appendString:@"_"];
+        }
+    }
+    if (clean.length == 0 || [clean hasPrefix:@"."]) {
+        [clean setString:[NSString stringWithFormat:@"mita_%lld.jpg", (long long)([[NSDate date] timeIntervalSince1970] * 1000.0)]];
+    }
+    if ([clean pathExtension].length == 0) [clean appendString:@".jpg"];
+    NSString *ext = [[clean pathExtension] lowercaseString];
+    BOOL isVideo = ([ext isEqualToString:@"mp4"] || [ext isEqualToString:@"mov"] || [ext isEqualToString:@"m4v"]);
+
+    NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"mita_lan_%lld_%@", (long long)([[NSDate date] timeIntervalSince1970] * 1000.0), clean]];
+    if (![rawBytes writeToFile:tmpPath atomically:YES]) {
+        return @{@"ok": @(NO), @"error": @"write_tmp_failed"};
+    }
+    NSURL *fileUrl = [NSURL fileURLWithPath:tmpPath];
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block BOOL saveOk = NO;
+    __block NSString *localId = @"";
+    __block NSString *errMsg = @"";
+
+    [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+        PHAssetChangeRequest *req = nil;
+        if (isVideo) {
+            req = [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:fileUrl];
+        } else {
+            req = [PHAssetChangeRequest creationRequestForAssetFromImageAtFileURL:fileUrl];
+            if (!req) {
+                UIImage *img = [UIImage imageWithContentsOfFile:tmpPath];
+                if (img) req = [PHAssetChangeRequest creationRequestForAssetFromImage:img];
+            }
+        }
+        if (req && req.placeholderForCreatedAsset.localIdentifier) {
+            localId = [req.placeholderForCreatedAsset.localIdentifier copy];
+        }
+    } completionHandler:^(BOOL success, NSError * _Nullable error) {
+        saveOk = success;
+        if (error) errMsg = [error localizedDescription] ?: [error description];
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(14.0 * NSEC_PER_SEC)));
+    [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
+
+    return @{
+        @"ok": @(saveOk),
+        @"local_id": localId ?: @"",
+        @"media_type": isVideo ? @"video" : @"image",
+        @"filename": clean,
+        @"bytes": @(rawBytes.length),
+        @"version": @"5.7.0",
+        @"error": errMsg ?: @""
+    };
+}
+
 - (void)handleClientFd:(int)fd {
-    struct timeval tv = {5, 0};
+    struct timeval tv = {15, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     NSMutableData *buf = [NSMutableData data];
-    char chunk[4096];
+    char chunk[16384];
     NSRange hdrEnd = NSMakeRange(NSNotFound, 0);
     NSData *sep = [@"\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding];
     NSInteger contentLen = 0;
 
-    while (buf.length < 262144) {
+    while (buf.length < 37748736) {
         ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
         if (n <= 0) break;
         [buf appendBytes:chunk length:(NSUInteger)n];
@@ -315,6 +385,35 @@
 
     if ([path isEqualToString:@"/ping"] || [path isEqualToString:@"/status"]) {
         respObj = [self buildPingPayload];
+    } else if ([path isEqualToString:@"/permissions"]) {
+        PHAuthorizationStatus rwSt = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite];
+        PHAuthorizationStatus addSt = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
+        respObj = @{
+            @"ok": @(YES),
+            @"version": @"5.7.0",
+            @"perm_photos": @(rwSt == PHAuthorizationStatusAuthorized || rwSt == PHAuthorizationStatusLimited),
+            @"perm_photos_add": @(addSt == PHAuthorizationStatusAuthorized),
+            @"perm_camera": @([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo] == AVAuthorizationStatusAuthorized),
+            @"perm_mic": @([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio] == AVAuthorizationStatusAuthorized),
+            @"push_media_supported": @(YES)
+        };
+    } else if ([path isEqualToString:@"/push_media"]) {
+        id inObj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : nil;
+        NSData *mediaData = nil;
+        NSString *fname = @"";
+        if ([inObj isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *dict = (NSDictionary *)inObj;
+            fname = [dict[@"filename"] isKindOfClass:[NSString class]] ? dict[@"filename"] : @"";
+            NSString *b64 = [dict[@"data_b64"] isKindOfClass:[NSString class]] ? dict[@"data_b64"] : @"";
+            NSRange comma = [b64 rangeOfString:@","];
+            if (comma.location != NSNotFound && [[b64 substringToIndex:comma.location] containsString:@"base64"]) {
+                b64 = [b64 substringFromIndex:(comma.location + 1)];
+            }
+            if (b64.length > 0) {
+                mediaData = [[NSData alloc] initWithBase64EncodedString:b64 options:NSDataBase64DecodingIgnoreUnknownCharacters];
+            }
+        }
+        respObj = [self saveMediaBytesToPhotos:mediaData filename:fname];
     } else if ([path isEqualToString:@"/config"]) {
         MitaConfigStore *store = [MitaConfigStore shared];
         if ([method isEqualToString:@"POST"] && bodyData.length > 0) {
@@ -364,12 +463,24 @@
     } else if ([path isEqualToString:@"/action"] && [method isEqualToString:@"POST"]) {
         id inObj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : @{};
         NSDictionary *act = [inObj isKindOfClass:[NSDictionary class]] ? inObj : @{};
-        if ([MitaConfigStore shared].remoteControlEnabled) {
-            [[MitaFloatingHudManager shared] triggerControlPulseSeconds:6.5 phase:@"controlling"];
+        NSString *aType = [[act[@"action"] ?: act[@"type"] ?: @"" description] lowercaseString];
+        if ([aType isEqualToString:@"push_media"]) {
+            NSString *fname = [act[@"filename"] isKindOfClass:[NSString class]] ? act[@"filename"] : @"";
+            NSString *b64 = [act[@"data_b64"] isKindOfClass:[NSString class]] ? act[@"data_b64"] : @"";
+            NSRange comma = [b64 rangeOfString:@","];
+            if (comma.location != NSNotFound && [[b64 substringToIndex:comma.location] containsString:@"base64"]) {
+                b64 = [b64 substringFromIndex:(comma.location + 1)];
+            }
+            NSData *mediaData = (b64.length > 0) ? [[NSData alloc] initWithBase64EncodedString:b64 options:NSDataBase64DecodingIgnoreUnknownCharacters] : nil;
+            respObj = [self saveMediaBytesToPhotos:mediaData filename:fname];
+        } else {
+            if ([MitaConfigStore shared].remoteControlEnabled) {
+                [[MitaFloatingHudManager shared] triggerControlPulseSeconds:6.5 phase:@"controlling"];
+            }
+            NSArray *batch = [act[@"actions"] isKindOfClass:[NSArray class]] ? act[@"actions"] : @[act];
+            NSArray *steps = [[MitaKeepAliveAndControl shared] executeActionBatch:batch];
+            respObj = @{@"ok": @(YES), @"steps": steps, @"version": @"5.7.0"};
         }
-        NSArray *batch = [act[@"actions"] isKindOfClass:[NSArray class]] ? act[@"actions"] : @[act];
-        NSArray *steps = [[MitaKeepAliveAndControl shared] executeActionBatch:batch];
-        respObj = @{@"ok": @(YES), @"steps": steps, @"version": @"5.5.0"};
     } else if ([path isEqualToString:@"/edge_pulse"]) {
         id inObj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : @{};
         NSDictionary *dict = [inObj isKindOfClass:[NSDictionary class]] ? inObj : @{};

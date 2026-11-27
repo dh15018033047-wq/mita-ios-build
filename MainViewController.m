@@ -5,6 +5,8 @@
 #import "MitaLanServer.h"
 #import "MitaFloatingHudManager.h"
 #import <WebKit/WebKit.h>
+#import <Photos/Photos.h>
+#import <AVFoundation/AVFoundation.h>
 
 @interface MainViewController () <WKScriptMessageHandler, WKUIDelegate, WKNavigationDelegate>
 @property (nonatomic, strong) WKWebView *webView;
@@ -102,11 +104,21 @@
     NSMutableDictionary *d = [[store toDictionaryRedactingKey:YES] mutableCopy];
     NSString *ip = [MitaKeepAliveAndControl deviceLanIPv4];
     d[@"platform"] = @"ios";
-    d[@"version"] = @"5.5.0";
+    d[@"version"] = @"5.7.0";
     d[@"device_ip"] = ip;
     d[@"lan_endpoint"] = [NSString stringWithFormat:@"http://%@:%d", ip, [MitaLanServer shared].listenPort];
     d[@"device_model"] = [MitaKeepAliveAndControl deviceModelName];
     d[@"ios_version"] = [UIDevice currentDevice].systemVersion ?: @"15.8.2";
+    PHAuthorizationStatus phSt = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite];
+    BOOL phFull = (phSt == PHAuthorizationStatusAuthorized);
+    BOOL phLimited = (phSt == PHAuthorizationStatusLimited);
+    NSString *phLabel = phFull ? @"所有照片" : (phLimited ? @"部分照片" : (phSt == PHAuthorizationStatusDenied || phSt == PHAuthorizationStatusRestricted ? @"已拒绝" : @"未授权"));
+    d[@"perm_photos"] = @(phFull || phLimited);
+    d[@"perm_photos_full"] = @(phFull);
+    d[@"perm_photos_label"] = phLabel;
+    d[@"perm_camera"] = @([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo] == AVAuthorizationStatusAuthorized);
+    d[@"perm_mic"] = @([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio] == AVAuthorizationStatusAuthorized);
+    d[@"push_media_supported"] = @(YES);
     d[@"remote_control_enabled"] = @(store.remoteControlEnabled);
     d[@"anti_burnin_enabled"] = @(store.antiBurninEnabled);
     d[@"anti_burnin_interval_sec"] = @(store.antiBurninIntervalSec);
@@ -216,6 +228,52 @@ completionHandler:(void (^)(NSString * _Nullable))completionHandler {
                 [[MitaKeepAliveAndControl shared] launchAppByNameOrBundleId:@"com.opa334.TrollStore"];
             } else if ([arg isEqualToString:@"keepalive"]) {
                 [[MitaKeepAliveAndControl shared] startSilentKeepAlive];
+            } else if ([arg isEqualToString:@"photos"]) {
+                PHAuthorizationStatus st = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite];
+                if (st == PHAuthorizationStatusNotDetermined) {
+                    __weak typeof(self) weakSelf = self;
+                    [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelReadWrite handler:^(PHAuthorizationStatus status) {
+                        [weakSelf notifyHostResume];
+                    }];
+                } else {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        NSURL *u = [NSURL URLWithString:UIApplicationOpenSettingsURLString];
+                        if (u) {
+                            [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:^(BOOL success) {
+                                if (!success) {
+                                    [[MitaKeepAliveAndControl shared] launchAppByNameOrBundleId:@"com.apple.Preferences"];
+                                }
+                            }];
+                        } else {
+                            [[MitaKeepAliveAndControl shared] launchAppByNameOrBundleId:@"com.apple.Preferences"];
+                        }
+                    });
+                }
+            } else if ([arg isEqualToString:@"camera"]) {
+                AVAuthorizationStatus camSt = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
+                if (camSt == AVAuthorizationStatusNotDetermined) {
+                    __weak typeof(self) weakSelf = self;
+                    [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:^(BOOL granted) {
+                        [weakSelf notifyHostResume];
+                    }];
+                } else {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        NSURL *u = [NSURL URLWithString:UIApplicationOpenSettingsURLString];
+                        if (u) [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:nil];
+                        else [[MitaKeepAliveAndControl shared] launchAppByNameOrBundleId:@"com.apple.Preferences"];
+                    });
+                }
+            } else if ([arg isEqualToString:@"app_settings"]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSURL *u = [NSURL URLWithString:UIApplicationOpenSettingsURLString];
+                    if (u) {
+                        [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:^(BOOL success) {
+                            if (!success) [[MitaKeepAliveAndControl shared] launchAppByNameOrBundleId:@"com.apple.Preferences"];
+                        }];
+                    } else {
+                        [[MitaKeepAliveAndControl shared] launchAppByNameOrBundleId:@"com.apple.Preferences"];
+                    }
+                });
             } else {
                 [[MitaKeepAliveAndControl shared] launchAppByNameOrBundleId:@"com.apple.Preferences"];
             }

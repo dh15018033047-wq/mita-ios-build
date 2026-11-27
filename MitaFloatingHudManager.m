@@ -120,7 +120,7 @@ static void MitaApplyRootPersonaAttr(posix_spawnattr_t *attr) {
     if (![obj isKindOfClass:[NSDictionary class]]) return NO;
     NSString *ver = [obj[@"version"] isKindOfClass:[NSString class]] ? obj[@"version"] : @"";
     if (ver.length == 0) return NO;
-    return ([ver isEqualToString:@"5.6.0"] || [ver compare:@"5.6.0" options:NSNumericSearch] != NSOrderedAscending);
+    return ([ver isEqualToString:@"5.7.0"] || [ver compare:@"5.7.0" options:NSNumericSearch] != NSOrderedAscending);
 }
 
 - (BOOL)isActive {

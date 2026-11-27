@@ -2,19 +2,25 @@
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <Photos/Photos.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <notify.h>
 #import <dlfcn.h>
 #import <signal.h>
+#import <spawn.h>
 #import <unistd.h>
 #import <sys/stat.h>
 #import <sys/sysctl.h>
 #import <sys/socket.h>
 #import <sys/select.h>
+#import <sys/wait.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
+#import <mach-o/dyld.h>
 #import <math.h>
+
+extern char **environ;
 
 #define MITA_NOTIFY_EDGE_CHANGED "com.mita.phoneagent.edge.changed"
 #define MITA_NOTIFY_EDGE_EXIT    "com.mita.phoneagent.edge.exit"
@@ -2105,9 +2111,10 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
     return @{
         @"ok": @(YES),
         @"daemon": @"MitaEdgeOverlay",
-        @"version": @"5.6.0",
+        @"version": @"5.7.0",
         @"port": @(19081),
         @"standby_discoverable": @(YES),
+        @"push_media_supported": @(YES),
         @"remote_enabled": @(self.overlayMasterVisible),
         @"overlay_master_visible": @(self.overlayMasterVisible),
         @"control_mode": modeOut,
@@ -2138,8 +2145,9 @@ static void MitaGlobalHidEventCallback(void *target, void *refcon, void *sender,
     NSDictionary *diag = @{
         @"pid": @(getpid()),
         @"uid": @(getuid()),
-        @"version": @"5.6.0",
+        @"version": @"5.7.0",
         @"standby_discoverable": @(YES),
+        @"push_media_supported": @(YES),
         @"remote_enabled": @(self.overlayMasterVisible),
         @"context_id": @(self.hostedContextId),
         @"overlay_master_visible": @(self.overlayMasterVisible),
@@ -2415,8 +2423,183 @@ static NSString *MitaEdgeExtractCopyText(NSDictionary *act) {
     return @"";
 }
 
+static NSString *MitaPhotoAuthString(PHAuthorizationStatus st) {
+    if (@available(iOS 14, *)) {
+        if (st == PHAuthorizationStatusLimited) return @"limited";
+    }
+    switch (st) {
+        case PHAuthorizationStatusAuthorized: return @"authorized";
+        case PHAuthorizationStatusDenied: return @"denied";
+        case PHAuthorizationStatusRestricted: return @"restricted";
+        default: return @"not_determined";
+    }
+}
+
+static NSDictionary *MitaSaveMediaFileToPhotosSync(NSString *filePath) {
+    if (![[NSFileManager defaultManager] fileExistsAtPath:filePath]) {
+        return @{@"ok": @(NO), @"error": @"media_file_missing"};
+    }
+    NSString *ext = [[filePath pathExtension] lowercaseString] ?: @"jpg";
+    BOOL isVideo = ([ext isEqualToString:@"mp4"] || [ext isEqualToString:@"mov"] || [ext isEqualToString:@"m4v"]);
+    NSURL *fileUrl = [NSURL fileURLWithPath:filePath];
+
+    __block PHAuthorizationStatus authSt = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
+    if (authSt == PHAuthorizationStatusNotDetermined) {
+        __block BOOL authDone = NO;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly handler:^(PHAuthorizationStatus status) {
+                authSt = status;
+                authDone = YES;
+            }];
+        });
+        NSTimeInterval deadline = [[NSDate date] timeIntervalSince1970] + 8.0;
+        while (!authDone && [[NSDate date] timeIntervalSince1970] < deadline) {
+            if ([NSThread isMainThread]) {
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.03, false);
+            } else {
+                usleep(30000);
+            }
+        }
+    }
+
+    __block BOOL saveOk = NO;
+    __block NSString *localId = @"";
+    __block NSString *errMsg = @"";
+    __block BOOL saveDone = NO;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+            PHAssetChangeRequest *req = nil;
+            if (isVideo) {
+                req = [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:fileUrl];
+            } else {
+                req = [PHAssetChangeRequest creationRequestForAssetFromImageAtFileURL:fileUrl];
+                if (!req) {
+                    UIImage *img = [UIImage imageWithContentsOfFile:filePath];
+                    if (img) {
+                        req = [PHAssetChangeRequest creationRequestForAssetFromImage:img];
+                    }
+                }
+            }
+            if (req && req.placeholderForCreatedAsset.localIdentifier) {
+                localId = [req.placeholderForCreatedAsset.localIdentifier copy];
+            }
+        } completionHandler:^(BOOL success, NSError * _Nullable error) {
+            saveOk = success;
+            if (error) {
+                errMsg = [error localizedDescription] ?: [error description];
+            }
+            saveDone = YES;
+        }];
+    });
+
+    NSTimeInterval saveDeadline = [[NSDate date] timeIntervalSince1970] + 15.0;
+    while (!saveDone && [[NSDate date] timeIntervalSince1970] < saveDeadline) {
+        if ([NSThread isMainThread]) {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.03, false);
+        } else {
+            usleep(30000);
+        }
+    }
+    if (!saveDone && errMsg.length == 0) {
+        errMsg = @"photos_commit_timeout";
+    }
+    return @{
+        @"ok": @(saveOk),
+        @"local_id": localId ?: @"",
+        @"media_type": isVideo ? @"video" : @"image",
+        @"photo_auth": MitaPhotoAuthString(authSt),
+        @"error": errMsg ?: @""
+    };
+}
+
+static NSDictionary *MitaPushMediaViaMobileHelper(NSData *mediaBytes, NSString *filename) {
+    if (!mediaBytes || mediaBytes.length == 0) {
+        return @{@"ok": @(NO), @"error": @"empty_media_bytes"};
+    }
+    NSMutableString *clean = [NSMutableString string];
+    NSString *rawName = filename ?: @"";
+    for (NSUInteger i = 0; i < rawName.length; i++) {
+        unichar ch = [rawName characterAtIndex:i];
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-') {
+            [clean appendFormat:@"%C", ch];
+        } else {
+            [clean appendString:@"_"];
+        }
+    }
+    if (clean.length == 0 || [clean hasPrefix:@"."]) {
+        [clean setString:[NSString stringWithFormat:@"mita_%lld.jpg", (long long)([[NSDate date] timeIntervalSince1970] * 1000.0)]];
+    }
+    if ([clean pathExtension].length == 0) {
+        [clean appendString:@".jpg"];
+    }
+
+    long long tsMs = (long long)([[NSDate date] timeIntervalSince1970] * 1000.0);
+    NSString *cacheDir = @"/var/mobile/Library/Caches";
+    [[NSFileManager defaultManager] createDirectoryAtPath:cacheDir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *mediaPath = [cacheDir stringByAppendingPathComponent:[NSString stringWithFormat:@"mita_push_%lld_%@", tsMs, clean]];
+    NSString *resJsonPath = [cacheDir stringByAppendingPathComponent:[NSString stringWithFormat:@"mita_push_%lld.json", tsMs]];
+
+    if (![mediaBytes writeToFile:mediaPath atomically:YES]) {
+        return @{@"ok": @(NO), @"error": @"write_temp_media_failed"};
+    }
+    chown([mediaPath UTF8String], 501, 501);
+    chmod([mediaPath UTF8String], 0666);
+
+    NSDictionary *result = nil;
+    char exeBuf[2048];
+    uint32_t exeLen = sizeof(exeBuf);
+    if (getuid() != 501 && _NSGetExecutablePath(exeBuf, &exeLen) == 0) {
+        typedef int (*MitaPMSetPersonaFn)(const posix_spawnattr_t * __restrict, uid_t, uint32_t);
+        typedef int (*MitaPMSetUidFn)(const posix_spawnattr_t * __restrict, uid_t);
+        MitaPMSetPersonaFn fnP = (MitaPMSetPersonaFn)dlsym(RTLD_DEFAULT, "posix_spawnattr_set_persona_np");
+        MitaPMSetUidFn fnU = (MitaPMSetUidFn)dlsym(RTLD_DEFAULT, "posix_spawnattr_set_persona_uid_np");
+        MitaPMSetUidFn fnG = (MitaPMSetUidFn)dlsym(RTLD_DEFAULT, "posix_spawnattr_set_persona_gid_np");
+
+        posix_spawnattr_t attr;
+        posix_spawnattr_init(&attr);
+        if (fnP) fnP(&attr, 99, 1);
+        if (fnU) fnU(&attr, 501);
+        if (fnG) fnG(&attr, 501);
+        const char *argvChild[] = { exeBuf, "-push_media", [mediaPath UTF8String], [resJsonPath UTF8String], NULL };
+        pid_t child = 0;
+        int spRc = posix_spawn(&child, exeBuf, NULL, &attr, (char * const *)argvChild, environ);
+        posix_spawnattr_destroy(&attr);
+
+        if (spRc == 0 && child > 0) {
+            int st = 0;
+            NSTimeInterval deadline = [[NSDate date] timeIntervalSince1970] + 15.0;
+            while ([[NSDate date] timeIntervalSince1970] < deadline) {
+                pid_t wr = waitpid(child, &st, WNOHANG);
+                if (wr == child || wr < 0) break;
+                usleep(25000);
+            }
+            NSData *jd = [NSData dataWithContentsOfFile:resJsonPath];
+            if (jd.length > 0) {
+                id obj = [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil];
+                if ([obj isKindOfClass:[NSDictionary class]]) {
+                    result = (NSDictionary *)obj;
+                }
+            }
+        }
+    }
+
+    if (!result) {
+        result = MitaSaveMediaFileToPhotosSync(mediaPath);
+    }
+
+    unlink([mediaPath UTF8String]);
+    unlink([resJsonPath UTF8String]);
+
+    NSMutableDictionary *out = [result mutableCopy] ?: [NSMutableDictionary dictionary];
+    out[@"bytes"] = @(mediaBytes.length);
+    out[@"filename"] = clean;
+    out[@"version"] = @"5.7.0";
+    return out;
+}
+
 static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak weakVC) {
-    struct timeval tv = {4, 0};
+    struct timeval tv = {18, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #ifdef SO_NOSIGPIPE
@@ -2424,22 +2607,28 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSig, sizeof(noSig));
 #endif
     NSMutableData *buf = [NSMutableData data];
-    char chunk[4096];
+    char chunk[16384];
     NSData *sep = [@"\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding];
     NSRange hdrEnd = NSMakeRange(NSNotFound, 0);
     NSInteger cLen = 0;
-    while (buf.length < 131072) {
+    while (buf.length < 37748736) {
         ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
         if (n <= 0) break;
         [buf appendBytes:chunk length:(NSUInteger)n];
         if (hdrEnd.location == NSNotFound) {
             hdrEnd = [buf rangeOfData:sep options:0 range:NSMakeRange(0, buf.length)];
             if (hdrEnd.location != NSNotFound) {
-                NSString *hs = [[NSString alloc] initWithData:[buf subdataWithRange:NSMakeRange(0, hdrEnd.location)] encoding:NSUTF8StringEncoding] ?: @"";
+                NSData *hdrSlice = [buf subdataWithRange:NSMakeRange(0, hdrEnd.location)];
+                NSString *hs = [[NSString alloc] initWithData:hdrSlice encoding:NSUTF8StringEncoding] ?: @"";
                 for (NSString *ln in [hs componentsSeparatedByString:@"\r\n"]) {
                     if ([[ln lowercaseString] hasPrefix:@"content-length:"]) {
                         cLen = [[[ln substringFromIndex:15] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]] integerValue];
                     }
+                }
+                if (cLen > 37748736) {
+                    MitaEdgeSendHttp(fd, 413, @{@"ok": @(NO), @"error": @"payload_too_large"});
+                    close(fd);
+                    return;
                 }
             }
         }
@@ -2448,13 +2637,15 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
     if (hdrEnd.location == NSNotFound) { close(fd); return; }
     NSString *hs = [[NSString alloc] initWithData:[buf subdataWithRange:NSMakeRange(0, hdrEnd.location)] encoding:NSUTF8StringEncoding] ?: @"";
     NSArray *parts = [[[hs componentsSeparatedByString:@"\r\n"] firstObject] componentsSeparatedByString:@" "];
-    NSString *path = (parts.count > 1) ? [[parts[1] componentsSeparatedByString:@"?"] firstObject] : @"/";
+    NSString *fullPath = (parts.count > 1) ? parts[1] : @"/";
+    NSString *path = [[fullPath componentsSeparatedByString:@"?"] firstObject] ?: @"/";
+    NSString *query = [fullPath containsString:@"?"] ? ([[fullPath componentsSeparatedByString:@"?"] lastObject] ?: @"") : @"";
     NSUInteger avail = (buf.length > hdrEnd.location + 4) ? (buf.length - hdrEnd.location - 4) : 0;
     NSUInteger take = (cLen > 0 && (NSUInteger)cLen < avail) ? (NSUInteger)cLen : avail;
     NSData *bodyData = (take > 0) ? [buf subdataWithRange:NSMakeRange(hdrEnd.location + 4, take)] : [NSData data];
 
     if ([path isEqualToString:@"/ping"] || [path isEqualToString:@"/status"]) {
-        __block NSDictionary *stOut = @{@"ok": @(YES), @"daemon": @"MitaEdgeOverlay", @"version": @"5.6.0", @"port": @(19081), @"standby_discoverable": @(YES)};
+        __block NSDictionary *stOut = @{@"ok": @(YES), @"daemon": @"MitaEdgeOverlay", @"version": @"5.7.0", @"port": @(19081), @"standby_discoverable": @(YES), @"push_media_supported": @(YES)};
         MitaEdgeRootViewController *strongVC = weakVC;
         if (strongVC) {
             dispatch_sync(dispatch_get_main_queue(), ^{
@@ -2462,8 +2653,43 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
             });
         }
         MitaEdgeSendHttp(fd, 200, stOut);
+    } else if ([path isEqualToString:@"/permissions"]) {
+        PHAuthorizationStatus rwSt = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite];
+        PHAuthorizationStatus addSt = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
+        MitaEdgeSendHttp(fd, 200, @{
+            @"ok": @(YES),
+            @"version": @"5.7.0",
+            @"photos_status": MitaPhotoAuthString(rwSt),
+            @"photos_add_status": MitaPhotoAuthString(addSt),
+            @"push_media_supported": @(YES)
+        });
+    } else if ([path isEqualToString:@"/push_media"]) {
+        id obj = bodyData.length ? [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil] : nil;
+        NSData *mediaData = nil;
+        NSString *fname = @"";
+        if ([obj isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *dict = (NSDictionary *)obj;
+            fname = [dict[@"filename"] isKindOfClass:[NSString class]] ? dict[@"filename"] : @"";
+            NSString *b64 = [dict[@"data_b64"] isKindOfClass:[NSString class]] ? dict[@"data_b64"] : @"";
+            NSRange comma = [b64 rangeOfString:@","];
+            if (comma.location != NSNotFound && [[b64 substringToIndex:comma.location] containsString:@"base64"]) {
+                b64 = [b64 substringFromIndex:(comma.location + 1)];
+            }
+            if (b64.length > 0) {
+                mediaData = [[NSData alloc] initWithBase64EncodedString:b64 options:NSDataBase64DecodingIgnoreUnknownCharacters];
+            }
+        } else if (bodyData.length > 0) {
+            mediaData = bodyData;
+            for (NSString *kv in [query componentsSeparatedByString:@"&"]) {
+                if ([kv hasPrefix:@"filename="]) {
+                    fname = [[kv substringFromIndex:9] stringByRemovingPercentEncoding] ?: @"";
+                }
+            }
+        }
+        NSDictionary *pmRes = MitaPushMediaViaMobileHelper(mediaData, fname);
+        MitaEdgeSendHttp(fd, 200, pmRes);
     } else if ([path isEqualToString:@"/exit"]) {
-        MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"exiting": @(YES), @"version": @"5.6.0"});
+        MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"exiting": @(YES), @"version": @"5.7.0"});
         close(fd);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_MSEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             if (gPidFilePath.length > 0) {
@@ -2637,6 +2863,16 @@ static void MitaEdgeHandleClient(int fd, MitaEdgeRootViewController * __weak wea
                 });
             }
             MitaEdgeSendHttp(fd, 200, @{@"ok": @(YES), @"channel": @"edge_19081_passthrough", @"ms": @(pMs), @"version": @"5.2.0"});
+        } else if ([actType isEqualToString:@"push_media"]) {
+            NSString *fname = [dict[@"filename"] isKindOfClass:[NSString class]] ? dict[@"filename"] : @"";
+            NSString *b64 = [dict[@"data_b64"] isKindOfClass:[NSString class]] ? dict[@"data_b64"] : @"";
+            NSRange comma = [b64 rangeOfString:@","];
+            if (comma.location != NSNotFound && [[b64 substringToIndex:comma.location] containsString:@"base64"]) {
+                b64 = [b64 substringFromIndex:(comma.location + 1)];
+            }
+            NSData *mediaData = (b64.length > 0) ? [[NSData alloc] initWithBase64EncodedString:b64 options:NSDataBase64DecodingIgnoreUnknownCharacters] : nil;
+            NSDictionary *pmRes = MitaPushMediaViaMobileHelper(mediaData, fname);
+            MitaEdgeSendHttp(fd, 200, pmRes);
         } else if ([actType isEqualToString:@"launch_app"] || [actType isEqualToString:@"open_app"]) {
             NSString *bid = [dict[@"bundle_id"] ?: dict[@"app"] ?: @"" description];
             __block BOOL opened = NO;
@@ -2955,6 +3191,18 @@ int main(int argc, char *argv[]) {
                 }
             }
             return 0;
+        }
+
+        if (strcmp(mode, "-push_media") == 0 && argc >= 4 && argv[2] != NULL && argv[3] != NULL) {
+            NSString *mediaPath = [NSString stringWithUTF8String:argv[2]];
+            NSString *resPath = [NSString stringWithUTF8String:argv[3]];
+            NSDictionary *res = MitaSaveMediaFileToPhotosSync(mediaPath);
+            NSData *jd = [NSJSONSerialization dataWithJSONObject:(res ?: @{@"ok": @(NO), @"error": @"empty_res"}) options:0 error:nil];
+            if (jd) {
+                [jd writeToFile:resPath atomically:YES];
+                chmod([resPath UTF8String], 0666);
+            }
+            return [res[@"ok"] boolValue] ? 0 : 1;
         }
 
         // v5.6.0 彻底根治真机双鼠标重影：通过 sysctl 扫描全系统进程表，清除所有同名 MitaEdgeOverlay 旧/孤儿实例（不仅依赖单个 PID 文件）！
